@@ -1,0 +1,8 @@
+# Default local Ollama chat endpoint
+url: http://localhost:11434/api/chat
+body:
+  model: gpt-oss:20b
+  stream: false
+  messages: []  # Filled at runtime
+headers: {}
+response_path: ["message", "content"]

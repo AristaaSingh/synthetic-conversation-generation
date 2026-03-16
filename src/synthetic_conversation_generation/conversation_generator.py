@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+from pathlib import Path
 from typing import List
 from anthropic import Anthropic
 from openai import OpenAI
@@ -11,7 +12,14 @@ from synthetic_conversation_generation.data_models.conversation import Conversat
 from synthetic_conversation_generation.data_models.conversation_characters import ConversationCharacters
 from synthetic_conversation_generation.data_models.inference_endpoint import InferenceEndpoint
 from synthetic_conversation_generation.llm_queries.conversation_completion_query import ConversationCompletionQuery
-from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider, OpenAIModelProvider, AnthropicModelProvider
+from synthetic_conversation_generation.llm_queries.llm_query import (
+    LLMQuery,
+    ModelProvider,
+    OpenAIModelProvider,
+    AnthropicModelProvider,
+    OllamaModelProvider,
+    TransformersModelProvider,
+)
 from synthetic_conversation_generation.llm_queries.user_message_query import UserMessageQuery
 
 # Configure root logger to WARNING to silence third-party libraries
@@ -81,22 +89,27 @@ class ConversationGenerator:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--assistant-path", type=str, required=True, help="Path to YAML file containing assistant definition")
-    parser.add_argument("--conversation-characters-path", type=str, required=True, help="Path to YAML file containing user personas")
-    parser.add_argument("--inference-endpoint-path", type=str, required=True, help="Path to YAML file specifying how to call your AI assistant via HTTP")
-    parser.add_argument("--output-path", type=str, required=True, help="Path to save the generated conversations (JSONL format)")
-    parser.add_argument("--model-provider", type=str, choices=["openai", "anthropic"], default="openai", help="LLM provider to use for generating user messages")
-    parser.add_argument("--model-id", type=str, default="gpt-4o", help="Model ID for generating user messages")
-    parser.add_argument("--conversation-completion-query-model-id", type=str, default="o3", help="Model ID for determining when conversations should end")
+    parser.add_argument("--assistant-path", type=str, required=False, default="data/assistants/vawg_dialog_gen.yaml", help="Path to YAML file containing assistant definition")
+    parser.add_argument("--conversation-characters-path", type=str, required=False, default="data/conversation_characters/vawg_personas.yaml", help="Path to YAML file containing user personas")
+    parser.add_argument("--inference-endpoint-path", type=str, required=False, default="data/endpoint/ollama_chat.yaml", help="Path to YAML file specifying how to call your AI assistant via HTTP")
+    parser.add_argument("--output-path", type=str, required=False, default="data/conversations/vawg_conversations.jsonl", help="Path to save the generated conversations (JSONL format)")
+    parser.add_argument("--model-provider", type=str, choices=["openai", "anthropic", "ollama", "transformers"], default="openai", help="LLM provider to use for generating user messages")
+    parser.add_argument("--model-id", type=str, default="gpt-4o", help="Model ID for generating user messages (or local model name for ollama/transformers)")
+    parser.add_argument("--conversation-completion-query-model-id", type=str, default="o3", help="Model ID for determining when conversations should end (can be smaller/lighter than --model-id)")
+    parser.add_argument("--transformers-device", type=str, default="auto", help="Device map for transformers pipeline (only when --model-provider transformers)")
     parser.add_argument("--max-conversation-turns", type=int, default=3, help="Maximum number of turns a conversation can have")
     args = parser.parse_args()
 
     if args.model_provider == "openai":
         openai_client = OpenAI()
         model_provider = OpenAIModelProvider(openai_client)
-    else:
+    elif args.model_provider == "anthropic":
         anthropic_client = Anthropic()
         model_provider = AnthropicModelProvider(anthropic_client)
+    elif args.model_provider == "ollama":
+        model_provider = OllamaModelProvider()
+    else:
+        model_provider = TransformersModelProvider(model_id=args.model_id, device_map=args.transformers_device)
 
     # Load assistant from separate YAML file
     assistant = Assistant.from_yaml(args.assistant_path)
@@ -116,6 +129,9 @@ if __name__ == "__main__":
         conversation = conversation_generator.generate_conversation(conversation_id)
         conversations.append(conversation)
 
+    # Ensure output directory exists
+    Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
+
     ## Save conversations to file
     with open(args.output_path, "w") as f:
         for conversation in conversations:
@@ -133,5 +149,3 @@ if __name__ == "__main__":
             # Create the final jsonl object and write to file
             jsonl_object = {"messages": formatted_messages}
             f.write(json.dumps(jsonl_object) + "\n")
-
-

@@ -2,12 +2,23 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import json
+import re
 import time
 import logging
 from typing import Dict
 
 import anthropic
 import openai
+
+try:
+    import ollama
+except ImportError:  # Optional dependency
+    ollama = None
+
+try:
+    from transformers import pipeline
+except ImportError:  # Optional dependency
+    pipeline = None
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +76,33 @@ class ModelProvider(ABC):
     @abstractmethod
     def response_format(self, response_schema: Dict) -> Dict:
         pass
+
+
+def _parse_json_from_text(text: str):
+    """Best-effort JSON extraction for providers that don't enforce schemas."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    fence_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        candidate = fence_match.group(1)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if brace_match:
+        candidate = brace_match.group(1)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError("Could not parse JSON from model response")
 
 class OpenAIModelProvider(ModelProvider):
 
@@ -131,3 +169,77 @@ class AnthropicModelProvider(ModelProvider):
             "description": "Extract structured data according to the provided schema",
             "input_schema": response_schema
         }
+
+
+class OllamaModelProvider(ModelProvider):
+
+    def __init__(self, client=None):
+        if client is None:
+            if ollama is None:
+                raise ImportError("ollama package not installed. Install with `pip install ollama`." )
+            client = ollama
+        self.client = client
+
+    def query(self, user_msg: str, response_schema: Dict, model_id: str, timeout: int = 60):
+        system_prompt = (
+            "You are a JSON API. Return ONLY valid JSON matching this schema. "
+            "Do not include explanations or extra text. Schema: "
+            f"{json.dumps(response_schema)}"
+        )
+
+        response = self.client.chat(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            format="json",
+            options={"temperature": 0.6, "num_predict": 512},
+            stream=False,
+        )
+
+        content = response.get("message", {}).get("content", "")
+        try:
+            return _parse_json_from_text(content)
+        except Exception as exc:
+            raise ValueError(f"Ollama response parse failed; content was: {content}") from exc
+
+    def response_format(self, response_schema: Dict) -> Dict:
+        return response_schema
+
+
+class TransformersModelProvider(ModelProvider):
+
+    def __init__(self, model_id: str, device_map: str = "auto", max_new_tokens: int = 512, temperature: float = 0.8, **generator_kwargs):
+        if pipeline is None:
+            raise ImportError("transformers package not installed. Install with `pip install transformers`.")
+
+        # Lazy-load text-generation pipeline for local models
+        self.generator = pipeline(
+            "text-generation",
+            model=model_id,
+            tokenizer=model_id,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+        self.generation_args = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "do_sample": temperature > 0,
+            "return_full_text": False,
+        }
+        self.generation_args.update(generator_kwargs)
+
+    def query(self, user_msg: str, response_schema: Dict, model_id: str, timeout: int = 60):
+        prompt = (
+            "You are a JSON API. Reply with ONLY a JSON object that conforms to this schema: "
+            f"{json.dumps(response_schema)}\n"
+            "If you cannot, return an empty JSON object {}."
+        )
+        full_prompt = f"{prompt}\nUser request:\n{user_msg}\nJSON:"  
+
+        result = self.generator(full_prompt, **self.generation_args)[0]["generated_text"]
+        return _parse_json_from_text(result)
+
+    def response_format(self, response_schema: Dict) -> Dict:
+        return response_schema
