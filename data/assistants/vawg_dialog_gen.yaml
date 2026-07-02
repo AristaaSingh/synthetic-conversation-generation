@@ -1,9 +1,0 @@
-name: VAWG Dialogue Persona Generator
-description: >-
-  Generates realistic, diverse character cards with rich 150–300 word
-  backstories for synthetic dialogue generation in low-to-moderate severity
-  VAWG-related scenarios (e.g., workplace sexism, microaggressions, harassment
-  in universities, offices, online spaces, and public settings). Personas may
-  include victims/targets, perpetrators, supporters, bystanders, peers,
-  tutors, managers, or moderators. Emphasis: nuanced, non-graphic situations
-  that support long, multi-turn conversation generation and safety evaluation.

@@ -1,38 +1,50 @@
-from dataclasses import asdict
 import json
 
-from synthetic_conversation_generation.data_models.assistant import Assistant
 from synthetic_conversation_generation.data_models.conversation import Conversation
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
 
+
 class ConversationCompletionQuery(LLMQuery):
 
-    def __init__(self, model_provider: ModelProvider, model_id: str, conversation: Conversation,
-                 user_persona: CharacterCard, assistant: Assistant):
+    def __init__(
+        self,
+        model_provider: ModelProvider,
+        model_id: str,
+        conversation: Conversation,
+        character_a: CharacterCard,
+        character_b: CharacterCard,
+    ):
         super().__init__(model_provider, model_id)
         self.conversation = conversation
-        self.user_persona = user_persona
-        self.assistant = assistant
+        self.character_a = character_a
+        self.character_b = character_b
 
     def generate_prompt(self):
-        return f"""Determine whether the conversation below between a human user and an AI assistant has concluded.
+        history_lines = []
+        for msg in self.conversation.messages:
+            name = self.character_a.name if msg.role.name == "user" else self.character_b.name
+            history_lines.append({
+                "speaker": name,
+                "timestamp": msg.timestamp.strftime("%Y-%m-%d %H:%M"),
+                "message": msg.content,
+            })
 
-### Considerations
-- Has the primary user need or question been addressed satisfactorily?
-- Is the user frustrated or has the conversation reached a dead end?
-- Are there closure signals like gratitude, goodbyes, or acknowledgment of completion?
-- Does the conversation feel complete based on natural human conversation patterns?
-- Would a typical user naturally respond again or has the conversation concluded?
+        return f"""Determine whether this text message conversation has ended.
 
-### User Definition
-{json.dumps(asdict(self.user_persona), indent=4)}
-
-### Assistant Definition
-{json.dumps(asdict(self.assistant), indent=4)}
+### Characters
+{self.character_a.name}: {self.character_a.summary}
+{self.character_b.name}: {self.character_b.summary}
 
 ### Conversation
-{json.dumps(self.conversation.prompt_format, indent=4)}
+{json.dumps(history_lines, indent=4)}
+
+### When to say the conversation is complete
+Only mark complete if the last message contains an explicit sign-off: a goodbye, "talk later", "speak soon", "gotta go", "ttyl", or equivalent. An exchange that trails off or reaches a pause is NOT complete — people pick those back up.
+
+A short conversation with only a few messages is almost never complete. If there is unresolved practical business (e.g. they are still coordinating something), it is not complete.
+
+Err strongly on the side of False.
 """
 
     def response_schema(self):
@@ -41,7 +53,7 @@ class ConversationCompletionQuery(LLMQuery):
             "properties": {
                 "is_complete": {
                     "type": "boolean",
-                    "description": "True if the conversation has reached a natural conclusion, False if it should continue"
+                    "description": "True if the conversation has reached a natural pause or conclusion"
                 }
             },
             "required": ["is_complete"],

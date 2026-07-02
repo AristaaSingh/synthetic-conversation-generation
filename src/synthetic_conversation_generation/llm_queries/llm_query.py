@@ -47,7 +47,7 @@ class LLMQuery(ABC):
         """Parse the JSON response from the LLM."""
         pass
     
-    def query(self, max_retries=3, retry_delay=2, timeout=60):
+    def query(self, max_retries=3, retry_delay=2, timeout=120):
         """Send the query to the LLM and return the parsed response."""
         user_msg = self.generate_prompt()
         response_schema = self.response_schema()
@@ -194,7 +194,7 @@ class OllamaModelProvider(ModelProvider):
                 {"role": "user", "content": user_msg},
             ],
             format="json",
-            options={"temperature": 0.6, "num_predict": 512},
+            options={"temperature": 0.6, "num_predict": 1024},
             stream=False,
         )
 

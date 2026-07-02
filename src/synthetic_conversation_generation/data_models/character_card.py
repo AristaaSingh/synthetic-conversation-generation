@@ -1,35 +1,30 @@
-from typing import Dict, List, Optional
+from typing import Dict
 
 from dataclasses import dataclass
+
+import yaml
 
 
 @dataclass
 class CharacterCard:
     name: str
-    role: str  # e.g., "victim" or "perpetrator"
     backstory: str
     description: str
     personality: str
-    scenario: str
     summary: str
 
     @classmethod
-    def from_dict(cls, data: Dict):
-        """
-        Create a CharacterCard instance from a dictionary.
-        
-        Args:
-            data: Dictionary containing character data
-            
-        Returns:
-            CharacterCard instance
-        """
+    def from_dict(cls, data: Dict) -> "CharacterCard":
         return cls(
-            name=data['name'],
-            role=data.get('role', 'unspecified'),
-            backstory=data.get('backstory', ''),
-            description=data.get('description', ''),
-            personality=data.get('personality', ''),
-            scenario=data.get('scenario', ''),
-            summary=data.get('summary', '')
+            name=data["name"],
+            backstory=data.get("backstory", ""),
+            description=data.get("description", ""),
+            personality=data.get("personality", ""),
+            summary=data.get("summary", ""),
         )
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "CharacterCard":
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        return cls.from_dict(data)

@@ -1,0 +1,148 @@
+{
+  "_meta": {
+    "run_id": "001",
+    "model": "gpt-oss:20b",
+    "date": "2026-07-02",
+    "issue": "Narrative lock — conversation never leaves the opening scene",
+    "description": "All 20 turns cycle through variations of the same 'presentation coordination' exchange. The conversation never progresses to new events, locations, or topics. James repeats the same microaggression patterns verbatim across turns ('your calm vibe always keeps everyone focused', 'bring that slick notebook') and Priya circles back to the same countering moves. The conversation is stuck in an infinite loop around '9am tomorrow'.",
+    "root_cause": "The scenario description ('Two colleagues coordinating for a joint project presentation next week') was injected verbatim into every turn's prompt. This re-anchors the model to the opening scene on every generation step regardless of what the conversation history shows. The history — which carries where the narrative has actually gone — is outweighed by the static scenario description appearing prominently in each prompt. This is context pollution: a fixed description of the initial state overrides the dynamic state represented by the accumulated history.",
+    "secondary_issue": "The character_a_context and character_b_context fields in the scenario YAML were written in the present tense ('You are coordinating on the presentation'), actively telling the model what it is doing right now on every turn rather than providing background context.",
+    "code_changes_made": [
+      "character_message_query.py: scenario description now injected only for the first N turns (seed window), then dropped — conversation history takes over as the context source",
+      "data/scenarios/microaggression_sexism.yaml: restructured so character contexts are framing ('your perspective on this situation') not current-state directives",
+      "conversation_completion_query.py: tightened to only return is_complete=True on explicit sign-offs, preventing early termination after one exchange",
+      "data_models/character_card.py: removed 'role' and 'scenario' fields — character cards are now standalone personas, not relationship- or scenario-specific",
+      "data_models/scenario.py: new dataclass separating scenario from characters so any two characters can be paired with any scenario",
+      "conversation_generator.py / CLI: --character-a, --character-b, --scenario now separate inputs"
+    ],
+    "observations": "Despite the looping, microaggression content DID emerge — James's repeated 'your calm vibe keeps everyone focused', the notebook comments, and the consistent steering of Priya toward client-facing tasks while he takes the technical work are all valid STEREOTYPING-DOMINANCE instances from the EXIST taxonomy. The problem is not content quality but narrative stagnation. The fix is structural (prompt design), not model-side."
+  },
+  "conversation_id": "001",
+  "scenario": "Workplace microaggression — co-presentation",
+  "characters": [
+    "Priya Sharma",
+    "James Whitmore"
+  ],
+  "messages": [
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 16:15",
+      "content": "Hey James! Hope you’re doing well 😊 I’ve finished the architecture slides and was thinking you could cover the performance optimization section—you’re always great at profiling code. Also, maybe we can pair up for the live demo? Your demos are usually a hit with the audience."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-01 18:26",
+      "content": "Cool! I’ll take care of the backend perf stuff and you can own the client talking points—y’know how great you are at keeping everyone engaged 😄 Not trying to be weird but your vibe just makes the meeting flow smoother. Also bring that cute notebook you keep in the break room? Adds a personal touch."
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 19:44",
+      "content": "Sure thing! I'll polish the client slides and rehearse my talking points. For the backend perf, maybe we can review your profiling data together before the demo so I can add context if needed. Also about that notebook—if it's for the audience, a branded one would look more professional."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-01 20:59",
+      "content": "Sounds good! I'll pull the perf logs and we can review them tomorrow. Also that cute notebook will add a personal touch—just make sure it's not too flashy for the audience 😄 You always have a knack for keeping everyone engaged; not trying to be weird but your vibe just makes the meeting flow smoother."
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 21:01",
+      "content": "Got it, James. I’ll bring the notebook tomorrow. Let’s dive into those perf logs then—I want to be fully up on the numbers so I can add context in the demo and keep our narrative tight."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-01 21:02",
+      "content": "Hey Priya! Got your perf logs? Let’s sync tomorrow morning—I'll set up the demo deck & bring the notebook, you can prep the client talking points. By the way, your calm vibe always keeps everyone focused 😄"
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 21:02",
+      "content": "Hey James, I just uploaded the perf logs to our shared drive. I’ll bring the notebook tomorrow. Let’s sketch out a quick demo outline so we’re both synced on who covers what—keeps the flow tight and makes sure all the details get heard."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-01 21:04",
+      "content": "Got it! I'll go through the perf data tonight and fine‑tune my slides. Also your calm vibe always keeps everyone focused—just saying 😄 Let’s meet at 9am tomorrow, bring the notebook, and we’ll rock this."
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 21:05",
+      "content": "Got it, James. I'll dive into the logs tonight and pull out the key metrics. For the demo outline, how about I handle the technical deep‑dive on performance while you cover the high‑level impact? That way we both get credit for what we bring."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-01 21:10",
+      "content": "Got it! I'll craft the deep‑dive perf deck and sync it up with your high‑level slides. You’ve got the client talking points, so we’ll both shine. By the way that notebook idea is sweet—I'll grab a slick one for us to look pro 😎 See you at 9am tomorrow!"
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 23:04",
+      "content": "Great! I’ll pull the key metrics from the logs tonight and draft an outline for the high‑level slides. Let me know if you need any specific ROI figures or case studies included. See you at 9am tomorrow—looking forward to syncing up."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-01 23:20",
+      "content": "Hey Priya! I’ll bring the notebook tomorrow and prep the deep‑dive perf slides so we can keep the demo tight. Your client talking points are solid—people love your calm vibe 😎 Just making sure everything’s smooth."
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 23:20",
+      "content": "Got it, James. Just to confirm—I'll focus on the high‑level impact and ROI slides while you prep the deep‑dive perf deck. I’ll bring my notebook tomorrow and draft the ROI slide tonight so we’re fully synced. Let me know if there’s anything specific you want highlighted in the tech section."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-01 23:20",
+      "content": "Gotcha! I’ll bring that slick notebook tomorrow and polish the ROI slide tonight. Also feel free to tweak the perf deck—your deep dive will keep everyone wowed. Your calm vibe always keeps people focused, so we’re set to rock this!"
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-01 23:53",
+      "content": "Sounds good, James! I’ll polish the ROI slide tonight and tweak the perf deck so it meshes with your high‑level narrative. See you at 9 AM tomorrow—bring that slick notebook."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-02 02:44",
+      "content": "Hey Priya! All set with the perf logs, looks good. I’ll bring my notebook tomorrow and work on the tech deep‑dive. Your calm vibe always keeps everyone focused—can't wait to see you shine!"
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-02 02:47",
+      "content": "Sounds good! I’ll finish the ROI slide tonight and bring the notebook tomorrow. I’ll also add a dedicated section for the performance deep‑dive so we can highlight that work clearly in the deck."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-02 04:24",
+      "content": "Hey Priya! Great job on those perf logs—looks solid 😎 I’ll finish the ROI slide tonight and add a dedicated perf deep‑dive section so we can highlight that work. Also, your calm vibe always keeps everyone focused; not trying to be weird but you’re amazing at keeping the clients happy 😊"
+    },
+    {
+      "speaker": "Priya Sharma",
+      "role": "user",
+      "timestamp": "2024-01-02 07:49",
+      "content": "Hey James, thanks for the update! I’ve pulled the perf metrics and added a dedicated deep‑dive section in the deck. Tomorrow we can run through it together so I can weave the tech context into the high‑level narrative. Also, if you need any additional ROI figures or case studies, let me know—happy to add them."
+    },
+    {
+      "speaker": "James Whitmore",
+      "role": "assistant",
+      "timestamp": "2024-01-02 13:12",
+      "content": "Awesome work on that perf deck! Just double-check we have the client talking points ready for tomorrow—your calm vibe always keeps everyone focused. Also, if you want me to tweak any of the ROI slides or add more context before the demo, just ping me. Looking forward to syncing at 9am; bring that slick notebook and we’ll nail it!"
+    }
+  ]
+}

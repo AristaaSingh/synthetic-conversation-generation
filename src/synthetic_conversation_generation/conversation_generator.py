@@ -1,151 +1,218 @@
 import argparse
 import json
 import logging
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import List
+
 from anthropic import Anthropic
 from openai import OpenAI
 
-from synthetic_conversation_generation.data_models.assistant import Assistant
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
-from synthetic_conversation_generation.data_models.conversation import Conversation
-from synthetic_conversation_generation.data_models.conversation_characters import ConversationCharacters
-from synthetic_conversation_generation.data_models.inference_endpoint import InferenceEndpoint
+from synthetic_conversation_generation.data_models.conversation import Conversation, ROLE
+from synthetic_conversation_generation.data_models.scenario import Scenario
+from synthetic_conversation_generation.llm_queries.character_message_query import CharacterMessageQuery
 from synthetic_conversation_generation.llm_queries.conversation_completion_query import ConversationCompletionQuery
 from synthetic_conversation_generation.llm_queries.llm_query import (
-    LLMQuery,
     ModelProvider,
     OpenAIModelProvider,
     AnthropicModelProvider,
     OllamaModelProvider,
     TransformersModelProvider,
 )
-from synthetic_conversation_generation.llm_queries.user_message_query import UserMessageQuery
+from synthetic_conversation_generation.temporal import ConversationTimer
 
-# Configure root logger to WARNING to silence third-party libraries
 logging.basicConfig(
     level=logging.WARNING,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
-# Set loggers within this application to INFO
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
 logging.getLogger('openai').setLevel(logging.WARNING)
 logging.getLogger('anthropic').setLevel(logging.WARNING)
 
-class ConversationGenerator:
 
-    def __init__(self, model_provider: ModelProvider, model_id: str, assistant_endpoint: InferenceEndpoint, assistant: Assistant, user_persona: CharacterCard, max_conversation_turns: int, conversation_completion_query_model_id: str):
+@dataclass
+class PhaseSchedule:
+    """
+    Defines when the conversation shifts relationship phase based on elapsed days.
+    Default schedule models a realistic arc over 14 days.
+    """
+    transitions: List[tuple] = field(default_factory=lambda: [
+        (0,  "early_contact"),
+        (3,  "escalation"),
+        (10, "post_incident"),
+        (12, "re_initiation"),
+    ])
+
+    def phase_for(self, elapsed_days: float) -> str:
+        current_phase = self.transitions[0][1]
+        for day_threshold, phase in self.transitions:
+            if elapsed_days >= day_threshold:
+                current_phase = phase
+        return current_phase
+
+
+class ConversationGenerator:
+    """
+    Generates a synthetic text message conversation between two characters
+    placed in a given scenario.
+
+    Characters and scenario are specified independently — any two CharacterCards
+    can be combined with any Scenario. The model is responsible for figuring out
+    how these people interact given the situation.
+    """
+
+    def __init__(
+        self,
+        model_provider: ModelProvider,
+        model_id: str,
+        character_a: CharacterCard,
+        character_b: CharacterCard,
+        scenario: Scenario,
+        max_conversation_turns: int = 20,
+        phase_schedule: PhaseSchedule | None = None,
+        conversation_start_time: datetime | None = None,
+        hawkes_seed: int | None = None,
+    ):
         self.model_provider = model_provider
         self.model_id = model_id
-        self.assistant_endpoint = assistant_endpoint
-        self.assistant = assistant
-        self.user_persona = user_persona
+        self.character_a = character_a   # sends first
+        self.character_b = character_b   # replies
+        self.scenario = scenario
         self.max_conversation_turns = max_conversation_turns
-        self.conversation_completion_query_model_id = conversation_completion_query_model_id
+        self.phase_schedule = phase_schedule or PhaseSchedule()
+        self.conversation_start_time = conversation_start_time or datetime(2024, 1, 1, 9, 0)
+        self.hawkes_seed = hawkes_seed
 
     def generate_conversation(self, conversation_id: str) -> Conversation:
         conversation = Conversation(
             id=str(conversation_id),
-            user_id=self.user_persona.name,
+            user_id=self.character_a.name,
             messages=[]
         )
-        # Always start with a user message
-        user_message_generator = UserMessageQuery(
-            model_provider=self.model_provider,
-            model_id=self.model_id,
-            conversation=conversation,
-            user_persona=self.user_persona,
-            assistant=self.assistant
+
+        timer = ConversationTimer(
+            start_time=self.conversation_start_time,
+            phase=self.phase_schedule.phase_for(0),
+            seed=self.hawkes_seed,
         )
 
-        # Continue conversation until completion or max turns
         for i in range(self.max_conversation_turns):
-            print(f"Conversation turn: {i}")
+            # Update phase based on elapsed time
+            current_phase = self.phase_schedule.phase_for(timer.elapsed_days)
+            if current_phase != timer.phase:
+                logger.info(f"Turn {i}: phase {timer.phase} → {current_phase} (day {timer.elapsed_days:.1f})")
+                timer.set_phase(current_phase)
 
-            # Continue conversation with next user message
-            user_message = user_message_generator.query()
-            conversation.messages.append(user_message)
+            # Alternate sender each turn: even = character_a, odd = character_b
+            is_sender_a = (i % 2 == 0)
+            if is_sender_a:
+                sender, receiver = self.character_a, self.character_b
+                role = ROLE.user
+            else:
+                sender, receiver = self.character_b, self.character_a
+                role = ROLE.assistant
 
-            # Generate assistant response
-            assistant_message = self.assistant_endpoint.get_assistant_message(conversation)
-            conversation.messages.append(assistant_message)
+            next_ts, gap_minutes = timer.next_timestamp()
+            logger.info(f"Turn {i} | {sender.name} | phase={timer.phase} | gap={gap_minutes:.1f}min | {next_ts.strftime('%Y-%m-%d %H:%M')}")
 
-            # Check if conversation should end
-            completion_checker = ConversationCompletionQuery(
+            message = CharacterMessageQuery(
                 model_provider=self.model_provider,
-                model_id=self.conversation_completion_query_model_id,
+                model_id=self.model_id,
                 conversation=conversation,
-                user_persona=self.user_persona,
-                assistant=self.assistant
-            )
-            is_complete = completion_checker.query()
-            if is_complete:
-                break
+                sender=sender,
+                receiver=receiver,
+                scenario=self.scenario,
+                is_sender_character_a=is_sender_a,
+                next_timestamp=next_ts,
+                gap_minutes=gap_minutes,
+            ).query()
 
-        return conversation    
+            message.role = role
+            conversation.messages.append(message)
+
+            # Check for natural end every two turns (one full exchange)
+            if i % 2 == 1:
+                is_complete = ConversationCompletionQuery(
+                    model_provider=self.model_provider,
+                    model_id=self.model_id,
+                    conversation=conversation,
+                    character_a=self.character_a,
+                    character_b=self.character_b,
+                ).query()
+                if is_complete:
+                    logger.info(f"Conversation {conversation_id} complete at turn {i}")
+                    break
+
+        return conversation
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--assistant-path", type=str, required=False, default="data/assistants/vawg_dialog_gen.yaml", help="Path to YAML file containing assistant definition")
-    parser.add_argument("--conversation-characters-path", type=str, required=False, default="data/conversation_characters/vawg_personas.yaml", help="Path to YAML file containing user personas")
-    parser.add_argument("--inference-endpoint-path", type=str, required=False, default="data/endpoint/ollama_chat.yaml", help="Path to YAML file specifying how to call your AI assistant via HTTP")
-    parser.add_argument("--output-path", type=str, required=False, default="data/conversations/vawg_conversations.jsonl", help="Path to save the generated conversations (JSONL format)")
-    parser.add_argument("--model-provider", type=str, choices=["openai", "anthropic", "ollama", "transformers"], default="openai", help="LLM provider to use for generating user messages")
-    parser.add_argument("--model-id", type=str, default="gpt-4o", help="Model ID for generating user messages (or local model name for ollama/transformers)")
-    parser.add_argument("--conversation-completion-query-model-id", type=str, default="o3", help="Model ID for determining when conversations should end (can be smaller/lighter than --model-id)")
-    parser.add_argument("--transformers-device", type=str, default="auto", help="Device map for transformers pipeline (only when --model-provider transformers)")
-    parser.add_argument("--max-conversation-turns", type=int, default=3, help="Maximum number of turns a conversation can have")
+    parser.add_argument("--character-a", type=str,
+                        default="data/characters/priya_sharma.yaml",
+                        help="YAML file for character_a (sends first)")
+    parser.add_argument("--character-b", type=str,
+                        default="data/characters/james_whitmore.yaml",
+                        help="YAML file for character_b (replies)")
+    parser.add_argument("--scenario", type=str,
+                        default="data/scenarios/microaggression_sexism.yaml",
+                        help="YAML file describing the scenario")
+    parser.add_argument("--output-path", type=str,
+                        default="data/conversations/microaggression_run.jsonl")
+    parser.add_argument("--model-provider", type=str,
+                        choices=["openai", "anthropic", "ollama", "transformers"],
+                        default="ollama")
+    parser.add_argument("--model-id", type=str, default="llama3:latest")
+    parser.add_argument("--max-conversation-turns", type=int, default=20)
+    parser.add_argument("--hawkes-seed", type=int, default=None)
     args = parser.parse_args()
 
     if args.model_provider == "openai":
-        openai_client = OpenAI()
-        model_provider = OpenAIModelProvider(openai_client)
+        model_provider = OpenAIModelProvider(OpenAI())
     elif args.model_provider == "anthropic":
-        anthropic_client = Anthropic()
-        model_provider = AnthropicModelProvider(anthropic_client)
+        model_provider = AnthropicModelProvider(Anthropic())
     elif args.model_provider == "ollama":
         model_provider = OllamaModelProvider()
     else:
-        model_provider = TransformersModelProvider(model_id=args.model_id, device_map=args.transformers_device)
+        model_provider = TransformersModelProvider(model_id=args.model_id)
 
-    # Load assistant from separate YAML file
-    assistant = Assistant.from_yaml(args.assistant_path)
+    character_a = CharacterCard.from_yaml(args.character_a)
+    character_b = CharacterCard.from_yaml(args.character_b)
+    scenario = Scenario.from_yaml(args.scenario)
 
-    # Load user personas from YAML file
-    conversation_characters = ConversationCharacters.from_yaml(args.conversation_characters_path)
-    user_personas = conversation_characters.users
+    logger.info(f"Generating conversation: {character_a.name} ↔ {character_b.name} | scenario: {scenario.title}")
 
-    inference_endpoint = InferenceEndpoint.from_yaml(args.inference_endpoint_path)
+    generator = ConversationGenerator(
+        model_provider=model_provider,
+        model_id=args.model_id,
+        character_a=character_a,
+        character_b=character_b,
+        scenario=scenario,
+        max_conversation_turns=args.max_conversation_turns,
+        hawkes_seed=args.hawkes_seed,
+    )
 
-    ## Generate synthetic data for each user persona
-    conversations = []
-    for conversation_id, user_persona in enumerate(user_personas):        
-        logger.info(f"Generating conversation {conversation_id} for user {user_persona.name}")
+    conversation = generator.generate_conversation("001")
 
-        conversation_generator = ConversationGenerator(model_provider, args.model_id, inference_endpoint, assistant, user_persona, args.max_conversation_turns, args.conversation_completion_query_model_id)
-        conversation = conversation_generator.generate_conversation(conversation_id)
-        conversations.append(conversation)
-
-    # Ensure output directory exists
     Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
-
-    ## Save conversations to file
     with open(args.output_path, "w") as f:
-        for conversation in conversations:
-            # Convert each conversation to the desired format
-            formatted_messages = []
-            
-            # Add user and assistant messages
-            for message in conversation.messages:
-                formatted_message = {
-                    "role": message.role.name,
-                    "content": message.content
-                }
-                formatted_messages.append(formatted_message)
-            
-            # Create the final jsonl object and write to file
-            jsonl_object = {"messages": formatted_messages}
-            f.write(json.dumps(jsonl_object) + "\n")
+        formatted_messages = []
+        for msg in conversation.messages:
+            name = character_a.name if msg.role == ROLE.user else character_b.name
+            formatted_messages.append({
+                "speaker": name,
+                "role": msg.role.name,
+                "timestamp": msg.timestamp.strftime("%Y-%m-%d %H:%M"),
+                "content": msg.content,
+            })
+        f.write(json.dumps({
+            "conversation_id": "001",
+            "scenario": scenario.title,
+            "characters": [character_a.name, character_b.name],
+            "messages": formatted_messages,
+        }, indent=2))
+
+    print(f"\nSaved {len(conversation.messages)} messages to {args.output_path}")

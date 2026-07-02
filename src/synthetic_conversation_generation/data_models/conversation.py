@@ -17,7 +17,12 @@ class Message:
 
     @property
     def prompt_format(self):
-        return {"message_id": self.message_id, "role": self.role.name.lower(), "content": self.content}
+        return {
+            "message_id": self.message_id,
+            "role": self.role.name.lower(),
+            "content": self.content,
+            "timestamp": self.timestamp.strftime("%Y-%m-%d %H:%M"),
+        }
 
 
 @dataclass
