@@ -16,6 +16,9 @@ dependencies = [
     "anthropic",
     "openai",
     "pyyaml",
+    "numpy",
+    "ollama",
+    "matplotlib",
 ]
 
 [tool.setuptools]

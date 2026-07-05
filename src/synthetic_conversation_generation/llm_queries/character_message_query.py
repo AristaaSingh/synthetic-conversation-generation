@@ -1,6 +1,8 @@
 from datetime import datetime
 import json
 
+from typing import Optional
+
 from synthetic_conversation_generation.data_models.conversation import Conversation, Message, ROLE
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.data_models.scenario import Scenario
@@ -44,6 +46,7 @@ class CharacterMessageQuery(LLMQuery):
         is_sender_character_a: bool,
         next_timestamp: datetime | None = None,
         gap_minutes: float | None = None,
+        state_summary: Optional[str] = None,
     ):
         super().__init__(model_provider, model_id)
         self.conversation = conversation
@@ -53,6 +56,7 @@ class CharacterMessageQuery(LLMQuery):
         self.is_sender_character_a = is_sender_character_a
         self.next_timestamp = next_timestamp or datetime.now()
         self.gap_minutes = gap_minutes
+        self.state_summary = state_summary
 
     def generate_prompt(self):
         turn_index = len(self.conversation.messages)
@@ -86,6 +90,13 @@ Relationship: {self.scenario.relationship.strip()}
                 "message": msg.content,
             })
 
+        state_section = ""
+        if self.state_summary:
+            state_section = f"""
+### Current state of the relationship
+{self.state_summary}
+"""
+
         return f"""You are {self.sender.name}. Write your next text message to {self.receiver.name}.
 
 ### You — {self.sender.name}
@@ -96,7 +107,7 @@ Relationship: {self.scenario.relationship.strip()}
 ### {self.receiver.name}
 {self.receiver.backstory.strip()}
 {self.receiver.description.strip()}
-{scenario_section}{temporal_context}
+{scenario_section}{state_section}{temporal_context}
 Write only the message text. Be completely faithful to who {self.sender.name} is. Let the conversation go wherever it naturally goes.
 
 ### Conversation so far
