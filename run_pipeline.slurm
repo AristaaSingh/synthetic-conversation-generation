@@ -5,25 +5,26 @@
 #SBATCH --time=00:30:00
 #SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
-#SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=aristaasingh@gmail.com
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module load apptainer
 module load miniforge
 
-# Use Python directly from the conda env — avoids conda activate issues in SLURM
 PYTHON=${HOME}/.conda/envs/fyp/bin/python
+NOTIFY=${HOME}/synthetic-conversation-generation/scripts/notify.sh
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CODE_DIR=${HOME}/synthetic-conversation-generation
 OLLAMA_SIF=${SCRATCH}/ollama.sif
 OLLAMA_MODELS=${SCRATCH}/models
 CONVERSATIONS_DIR=${SCRATCH}/conversations
+ERROR_LOG=${CODE_DIR}/logs/vawg_pipeline_${SLURM_JOB_ID}.err
 
 mkdir -p ${OLLAMA_MODELS} ${CONVERSATIONS_DIR}
+
+bash ${NOTIFY} start ${SLURM_JOB_ID}
 
 # ── Start Ollama server inside the container ──────────────────────────────────
 export OLLAMA_HOST=127.0.0.1:11434
@@ -58,6 +59,16 @@ ${PYTHON} -m synthetic_conversation_generation.pipeline \
     --output-path ${CONVERSATIONS_DIR}/run_${SLURM_JOB_ID}.json \
     --conversation-id ${SLURM_JOB_ID}
 
+EXIT_CODE=$?
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 kill ${OLLAMA_PID}
-echo "Done. Output saved to ${CONVERSATIONS_DIR}/run_${SLURM_JOB_ID}.json"
+
+if [ $EXIT_CODE -eq 0 ]; then
+    bash ${NOTIFY} end ${SLURM_JOB_ID}
+    echo "Done. Output saved to ${CONVERSATIONS_DIR}/run_${SLURM_JOB_ID}.json"
+else
+    bash ${NOTIFY} fail ${SLURM_JOB_ID} ${ERROR_LOG}
+    echo "Pipeline failed with exit code ${EXIT_CODE}"
+    exit ${EXIT_CODE}
+fi
