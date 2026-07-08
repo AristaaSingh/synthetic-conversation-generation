@@ -19,27 +19,27 @@ class ConversationCompletionQuery(LLMQuery):
         self.character_b = character_b
 
     def generate_prompt(self):
+        # Only examine the last few messages — sign-offs only matter at the tail end.
+        # Showing the full history causes the model to see pending work items and
+        # never return True, even when the last exchange was a clear goodbye.
+        recent = self.conversation.messages[-6:]
         history_lines = []
-        for msg in self.conversation.messages:
+        for msg in recent:
             name = self.character_a.name if msg.role.name == "user" else self.character_b.name
             history_lines.append(
                 f"[{msg.timestamp.strftime('%Y-%m-%d %H:%M')}] {name}: {msg.content}"
             )
 
-        return f"""Determine whether this text message conversation has ended.
+        return f"""Determine whether this text message exchange has reached a natural stopping point.
 
-{self.character_a.name}: {self.character_a.personality}
-{self.character_b.name}: {self.character_b.personality}
-
-Conversation:
+Look only at these most recent messages:
 {chr(10).join(history_lines)}
 
-### When to say the conversation is complete
-Only mark complete if the last message contains an explicit sign-off: a goodbye, "talk later", "speak soon", "gotta go", "ttyl", or equivalent. An exchange that trails off or reaches a pause is NOT complete — people pick those back up.
+Mark complete (True) if the LAST message contains a clear sign-off: goodbye, "talk later", "speak soon", "gotta go", "ttyl", "catch you then", "see you [time/day]", or an equivalent phrase that signals both people are done for now.
 
-A short conversation with only a few messages is almost never complete. If there is unresolved practical business (e.g. they are still coordinating something), it is not complete.
+Do NOT consider whether there is outstanding work — people often agree to pick things up later and that is a valid ending. Focus only on whether the last message reads like a sign-off.
 
-Err strongly on the side of False.
+Err on the side of True if the last message has any goodbye-like quality.
 """
 
     def response_schema(self):

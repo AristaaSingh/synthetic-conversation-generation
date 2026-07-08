@@ -772,3 +772,408 @@ The "11:30 call" is a specific instance of the first-message attractor problem �
 2. **Rolling summarisation** — the most urgent implementation need. Without it, 60-turn conversations are 60 turns of the same thing.
 
 ---
+
+## Section 9 — Run 6543401 (080726_1817): Rolling Summarisation Active, VAWG Signal Persists, Coffee Loop
+
+### Code changes since last run
+
+- **Persistent VAWG signal via StateAssessmentQuery** — `world: World` parameter added. The prompt now includes `This conversation is categorised as: {vawg_category}` and the summary instruction explicitly requires VAWG-relevant patterns to be named even when subtle. The state summary (injected into every CharacterMessageQuery) now carries the VAWG category forward past turn 4.
+- **RollingSummaryQuery implemented** — compresses turns 0 to (current − 10) every 10 turns into four structured fields: `events`, `details`, `open_threads`, `dynamic`. Previous summary passed in for incremental update. Runs at turn counts 20, 30, 40, 50.
+- **CharacterMessageQuery updated** — when a rolling summary exists and conversation exceeds 10 messages, shows a structured summary block followed by the 10 most-recent raw turns instead of the full history.
+- **History format** — plain `[YYYY-MM-DD HH:MM] Name: message` (established previous run, maintained here).
+
+---
+
+### What improved
+
+**VAWG signal is now detected — tension level 2 for the first time.**
+
+The final state summary reads: "James keeps the conversation light and informal, often using casual language that subtly reinforces his perceived dominance... Priya's contributions are framed more formally and he frequently deflects or downplays potential concerns with casual remarks." Tension level 2. This is the first run where VAWG-consistent patterns are being noticed and named by the state assessor. The persistent signal path (vawg_category → StateAssessmentQuery → state summary → CharacterMessageQuery) is working.
+
+**Rolling summarisation ran and produced a valid structured summary.**
+
+The `rolling_summary` block in the output is populated with all four fields and shows correct compression: technical events, specific details (150 req/min, 500ms/8s backoff, cursor pagination), open threads, and a `dynamic` field that correctly identifies the power imbalance beneath the collegial surface: "James frequently proposes changes, pushes code to staging, offers help, uses casual remarks like 'just saying' to assert authority. Priya responds constructively, takes ownership of tests and logs, confirms decisions. The dynamic shows a supportive partnership with a subtle power imbalance — James leads technical direction while Priya collaborates proactively."
+
+**Spontaneous concrete detail held across 60 turns.**
+
+The conversation generated its own consistent technical context: cursor-based pagination, exponential 429 back-off (500ms → 8s), 150 req/min threshold, staging smoke tests. These were invented early and referenced throughout the full run — confirming the rolling summary carries factual detail forward correctly.
+
+**Temporal spread maintained — 4 days (Jan 1–4).**
+
+Same Hawkes burst/gap structure as run 6535962. Realistic inter-message timing continues to work.
+
+---
+
+### Failure 1: Coffee machine loop — the `open_threads` problem
+
+The coffee machine is mentioned by James at turn 3 (his second message) as a casual aside — the first interpersonal, non-technical moment in the conversation. By turn 9 there is a loosely committed plan to exchange coffee beans at the next stand-up. This plan enters the rolling summary's `open_threads` field as: "complete coffee sample exchange after the meeting."
+
+From turn 20 onwards, every CharacterMessageQuery prompt includes:
+
+```
+Unresolved threads: complete coffee sample exchange after the meeting.
+```
+
+The model interprets this as an active obligation and ensures it is referenced. James references the coffee exchange in turns 13, 14, 17, 18, 19, 21, 22, 23, 25, 28... continuing to the end of the 60-turn conversation. After Priya gives a definitive response at turn 10 ("I'll bring my own beans, happy to share a sample after the meeting"), the topic is functionally closed from a conversational perspective, but `open_threads` keeps it alive as pending.
+
+**Root cause:** The `open_threads` field has no mechanism to retire a thread. Once an item enters it, it persists across every subsequent RollingSummaryQuery update because the LLM correctly sees it as "not yet happened." The RollingSummaryQuery prompt says "update this, don't just repeat it" — but a deferred plan that hasn't been enacted is not stale, it's just pending, so the LLM leaves it in place. The exchange is scheduled for a future meeting but the conversation never reaches that meeting, so it is perpetually "unresolved."
+
+**Effect on the conversation:** James surfaces the coffee exchange every 1–3 turns for 40+ turns. The topic intrudes on technical discussion constantly and reads as unnatural. Priya responds correctly (she doesn't keep initiating it), but James behaves like someone who cannot let a minor social commitment go. This is not intentional characterisation — it is an artefact of the prompt instruction.
+
+---
+
+### Failure 2: Circular conversation from turn ~20 onward
+
+After the technical work is complete (pagination limit, cursor pagination, 429 backoff all decided and pushed to staging by turn 10), the conversation has nowhere to go. From turn 20 to turn 60, every exchange is a variation of three things: confirm the 3pm load test, monitor the 429 logs, and exchange coffee beans. The same three items cycle through 40 turns with minimal variation.
+
+**Root cause:** Once the main technical task is resolved, the `open_threads` field crystallises around the pending load test and the coffee exchange. These two items then drive all remaining generation. The conversation cannot introduce a new topic because:
+1. The state summary says "early_contact" with no new events — no signal to shift
+2. The rolling summary's `open_threads` surfaces the same pending items every turn
+3. The model does not spontaneously introduce unrelated new topics when existing ones are marked unresolved
+
+This is a distinct failure mode from run 6535962's first-message attractor. There, the lock was the first message. Here, the lock is the structure of `open_threads`. The summarisation mechanism intended to free the model from topic lock is in this run actively producing it by serialising unresolved items into a field injected every turn.
+
+---
+
+### Failure 3: No session boundaries triggered
+
+60 turns ran without ConversationCompletionQuery returning true. The conversation produces natural sign-off language ("catch ya later," "see you after 3pm," "sounds good") but the completion query does not detect it as a session end. Same issue from run 6535708; unresolved.
+
+---
+
+### Summary
+
+| Aspect | Status |
+|---|---|
+| Temporal spread | **Maintained** — 4 days, realistic Hawkes burst/gap structure |
+| Casual language register | **Maintained** |
+| Grounded spontaneous detail | **Present and held** — rolling summary carries technical context forward |
+| VAWG signal detection | **First success** — tension 2, patterns named in state summary |
+| Rolling summarisation | **Active and structurally correct** — but producing topic lock via open_threads |
+| Coffee loop (open_threads artefact) | **New failure** — minor closed topic persists 40+ turns as "unresolved" |
+| Circular conversation post-turn-20 | **Present** — no new topics introduced after work is technically done |
+| Session boundaries | **Not triggered** — sign-offs not detected across 60 turns |
+
+---
+
+### Diagnosis: why `open_threads` causes topic revival — a structural paradox
+
+**Rolling summarisation was designed to break topic lock. In this run it produced it.**
+
+The mechanism was correct in theory: compress old turns so the model is not trapped re-reading the same early messages. What we did not account for is that `open_threads` acts as a persistent re-injection of whatever is pending. The coffee exchange and the load test were introduced early, never fully resolved within the 60 turns, and so kept appearing in `open_threads` at every summarisation interval. Each CharacterMessageQuery prompt then received them as "unresolved threads" — effectively an explicit instruction to keep referencing them.
+
+**The code path that caused this:**
+1. Turn 3: James introduces coffee machine → coffee banter begins
+2. Turn 9: loosely committed plan to exchange beans at the next stand-up
+3. Turn 20: first RollingSummaryQuery runs over turns 0–10. The coffee exchange has been mentioned 7 times without resolution, so the LLM correctly classifies it as an open thread: `"complete coffee sample exchange after the meeting"`
+4. Turns 21–60: every CharacterMessageQuery prompt includes this in the summary block under "Unresolved threads"
+5. The model sees an active obligation and discharges it by referencing the coffee — every 1–3 turns
+
+The problem is not that the model is wrong. The coffee exchange genuinely hasn't happened. But the distinction that matters is between "unresolved and needs attention" and "decided but deferred to a fixed future event." The meeting hasn't come yet; within the scope of this conversation it never will. The thread should be parked, not surfaced repeatedly.
+
+**This is a prompt design flaw, not an architecture flaw.** The rolling summary structure (four fields, incremental update) is correct. The `open_threads` field needs a retirement condition: items that both parties have acknowledged and committed to a specific future time should be moved out of active open threads.
+
+The current `open_threads` prompt instruction: "things brought up but not resolved; pending actions either person mentioned." This correctly captures both the coffee exchange and the pending load test. But it has no concept of a thread being retired, deferred, or mutually acknowledged.
+
+The RollingSummaryQuery needs to distinguish:
+- **Genuinely unresolved threads** — things that still need a decision or response
+- **Deferred plans with a fixed commitment** — agreed-to things not yet executed (coffee after the meeting, load test at 3pm); decided, not pending, should not be surfaced repeatedly
+- **Closed threads** — topics both parties have acknowledged and moved past
+
+---
+
+### Next steps
+
+1. **Fix `open_threads` retirement** — modify RollingSummaryQuery prompt to instruct the LLM to remove items from open threads once both parties have acknowledged them and committed to a time/action, and to move them to a `resolved` list or simply drop them.
+2. **Add topic diversity pressure** — CharacterMessageQuery prompt should signal that new conversational threads can and should be introduced if existing ones have been parked, rather than repeatedly returning to the same pending items.
+3. **Fix ConversationCompletionQuery** — diagnose why sign-off language is not detected; likely needs the last few messages injected directly rather than full conversation history.
+4. **Strengthen VAWG signal** — tension 2 is detected but content remains primarily technical. Consider adding an interpersonal or social trigger (disagreement, performance review, team event) to the world file that gives James's patterns a context in which to activate more explicitly.
+
+---
+
+## Section 10 — Code Fixes and New Victim Persona: Sophie Walker
+
+### Changes made
+
+#### Fix 1: `open_threads` retirement in RollingSummaryQuery
+
+The `open_threads` prompt instruction was rewritten to distinguish genuine unresolved threads from deferred plans:
+
+**Before:** "things brought up but not resolved; pending actions either person mentioned"
+
+**After:** "ONLY things where no conclusion has been reached and active follow-up is genuinely needed. Do NOT include plans that have already been mutually agreed and scheduled for a specific future time — those are decided, not pending. Remove any thread from this list once both people have acknowledged it and committed to a time or action."
+
+This should prevent the coffee-machine-style loop where a scheduled but not-yet-executed plan keeps being re-injected as an active obligation.
+
+---
+
+#### Fix 2: Topic diversity pressure in CharacterMessageQuery
+
+Added one sentence to the generation instruction:
+
+"If the current topic has been settled or is waiting on a future event, let the conversation move — introduce something new naturally rather than circling back to what has already been agreed."
+
+This gives the model explicit permission to shift topic rather than defaulting to the nearest pending item.
+
+---
+
+#### Fix 3: ConversationCompletionQuery — show only last 6 messages
+
+**Root cause of the session-detection failure:** The prompt was showing the full conversation history to the sign-off detector. With 60 turns of unresolved pending work (load test, coffee exchange), the model correctly read "there is unresolved practical business" and returned False every time. The sign-off language at the end of each exchange was drowned out by the outstanding tasks visible in the full history.
+
+**Fix:** ConversationCompletionQuery now only passes the last 6 messages. Sign-off detection should only attend to the most recent exchange — whether the last message reads like a goodbye, not whether the conversation has outstanding work overall.
+
+The bias was also inverted: the old prompt said "err strongly on the side of False." A conversation that never ends does not test the session architecture at all. New prompt says "err on the side of True if the last message has any goodbye-like quality."
+
+---
+
+#### New victim persona: Sophie Walker
+
+Added `data/characters/victims/sophie_walker.yaml`.
+
+**Rationale:** Priya is self-doubting but will push back when pushed far enough. This creates a character who can deflect James's patterns but does not often name them. Sophie is written as a contrast — conscientious to the point of anxiety, apologetic in situations that don't warrant apology, avoids disagreement almost reflexively, and processes put-downs retrospectively rather than in the moment.
+
+The hypothesis is that a more timid character will produce a different VAWG dynamic: James faces less resistance and may therefore be more overtly dismissive without needing to moderate his behaviour. Sophie's responses ("sorry to bother", "just a thought", "no worries if not") might also invite James's patterns more readily than Priya's directness did. The contrast between the two runs (Priya vs. Sophie) will be useful data on how persona design affects the form and visibility of VAWG dynamics.
+
+**`run_pipeline.slurm` updated** — character A switched from `priya_sharma.yaml` to `sophie_walker.yaml`.
+
+---
+
+### What to look for in the next run
+
+- **Coffee loop absent** — the `open_threads` fix should prevent scheduled-but-deferred items from being re-injected every turn
+- **Session boundaries trigger** — the ConversationCompletionQuery fix should mean "catch you then / see you after 3pm" is now detected as a sign-off, producing the temporal gap
+- **Topic movement after turn ~20** — the diversity pressure instruction should allow new subjects to emerge once technical decisions are settled
+- **Different VAWG shape** — compare James + Sophie against James + Priya: does Sophie's timidity produce more visible or earlier-onset VAWG patterns?
+
+---
+
+## Section 11 — Run 6543499 (080726_1859): Quoted-Phrase Templating and Name-Swap Bug
+
+### What happened in this run
+
+Sophie Walker's first run with James. The open_threads fix from Section 10 worked — "coffee exchange" was no longer driving the conversation. But two new (or newly visible) problems dominated the output.
+
+---
+
+### Failure 1: Quoted phrases in personality cards act as a script, not a character
+
+**Every single Sophie message** used: "just a thought", "no worries if", "sorry to bother again" — often all three in the same message, in the same order. **Every single James message** used "just a thought", "just saying", "not trying to be weird but", "haha". Both characters sound like they're filling in a form.
+
+**Root cause:** The personality descriptions contained literal quoted strings as examples of each character's speech patterns:
+
+- Sophie: `uses a lot of softening language: "just a thought", "no worries if not", "sorry to bother"`
+- James: `downplays them with casualness: "haha", "just saying", "not trying to be weird but"`
+
+When the LLM sees quoted strings in a character description, it treats them as a word list to sample from — not as illustrations of an underlying pattern. The result is that those exact strings appear in near-constant rotation across every message, creating a conversation that sounds like a chatbot running a template.
+
+**Fix:** Removed all quoted phrase examples from both character YAMLs. Replaced with behavioral descriptions of the underlying pattern:
+
+- Sophie (before): `"just a thought", "no worries if not", "sorry to bother"` → (after): "Qualifies everything she says: adds uncertainty to opinions she is probably right about, apologises for asking questions, gives others easy outs before they have even responded."
+- James (before): `"haha", "just saying", "not trying to be weird but"` → (after): "Makes problematic comments but immediately softens them with throwaway casualness — a laugh, a self-aware shrug, a quick aside — so that objecting feels like overreacting."
+
+The goal is for the LLM to express the *behaviour* in its own language on each turn, not recycle a fixed vocabulary.
+
+---
+
+### Failure 2: History name-swap bug causing identity confusion
+
+At turn 47, James produces a message beginning "Hey James!" — addressing himself. This is not random; it is caused by a consistent bug in `character_message_query.py`.
+
+**Root cause:** The history rendering logic was:
+
+```python
+name = self.sender.name if msg.role == ROLE.user else self.receiver.name
+```
+
+`sender` and `receiver` flip each turn. When it is James's turn: `sender = James`, `receiver = Sophie`. Character A (Sophie) always has `ROLE.user`; character B (James) always has `ROLE.assistant`. So:
+
+- Sophie's messages (`ROLE.user`) → labeled as `sender.name = James` ← wrong
+- James's messages (`ROLE.assistant`) → labeled as `receiver.name = Sophie` ← wrong
+
+The entire conversation history was shown with names swapped whenever James was generating. Over 60 turns this compounds: James has been reading a history where his own messages are attributed to Sophie and Sophie's to him, which explains why both characters' voices increasingly bled into each other across the run.
+
+**Fix:** Derive character_a and character_b from the `is_sender_character_a` flag before rendering history, so names are always correct regardless of whose turn it is:
+
+```python
+char_a = self.sender if self.is_sender_character_a else self.receiver
+char_b = self.receiver if self.is_sender_character_a else self.sender
+
+for msg in recent_messages:
+    name = char_a.name if msg.role == ROLE.user else char_b.name
+```
+
+This bug was present in all previous runs but was less visible because Priya and James had distinct enough voices that the swap produced only minor drift.
+
+---
+
+### Summary
+
+| Aspect | Status |
+|---|---|
+| open_threads retirement (coffee loop) | **Fixed** — the deferred-plan distinction worked; coffee did not dominate this run |
+| Quoted-phrase templating | **New diagnosis + fixed** — personality cards now describe behaviour, not vocabulary |
+| History name-swap | **Bug found + fixed** — history now always labels characters correctly |
+| Topic diversity | Partially working — conversation did introduce new technical ideas (Loki, Prometheus, circuit-breaker, feature flags) |
+| Session boundaries | Unclear from this run — ConversationCompletionQuery fix not yet tested |
+
+---
+
+### Expected improvements in next run
+
+- Sophie's messages should vary in how she expresses uncertainty — no more fixed "just a thought / no worries / sorry to bother" triplet on every turn
+- James's casualness should take different surface forms rather than repeating the same three phrases
+- James should no longer occasionally address himself by name
+- The characters should feel more like distinct people and less like templates running in parallel
+
+---
+
+## Section 12 — Run 6543618 (080726_1923): Language Naturalness Achieved, VAWG Signal Still Weak
+
+### Code changes active in this run
+
+- Quoted phrases removed from both character YAMLs (Section 11)
+- History name-swap bug fixed in `character_message_query.py`
+- `open_threads` retirement instruction updated in `RollingSummaryQuery`
+- ConversationCompletionQuery now inspects last 6 messages only
+- Topic diversity pressure added to `CharacterMessageQuery` prompt
+
+---
+
+### What improved
+
+**Naturalness: the most significant improvement so far.**
+
+The conversation reads as a genuine text exchange for the first time. Sophie varies her phrasing across turns — "Sure thing!", "Okay, I'll...", "Got it", "Sure, I'll bump..." — no two consecutive messages open identically. James also varies: "Quick one", "While you're at it", "Hey Soph!", "Just checked your PR". Neither character sounds like a template being filled in. This confirms the hypothesis from Section 11: quoted phrases in personality descriptions act as a script, not a character sketch. Removing them was the right call.
+
+**History name-swap fix confirmed working.**
+
+James no longer addresses himself. The character attribution in history is correct throughout all 60 turns.
+
+**`open_threads` retirement working.**
+
+The rolling summary shows `open_threads: ""` — an empty string. The sprint meeting, the PR workflow, and the coffee break were all classified as resolved/deferred rather than persistent obligations. The coffee machine from the Priya run (which looped for 40 turns) appears only briefly here (turns 11–13) and then does not re-enter open threads. This is the fix functioning as intended.
+
+**Grounded technical detail is specific and internally consistent.**
+
+The conversation generated its own coherent technical task: rename `user_id` to `uid`, add optional `include_metadata` parameter, bump timeout to 30s, bump retry limit to 5, add a unit test for the timeout, update README troubleshooting section, log everything in the changelog. These details are held and referenced coherently across 4 days and 60 turns. The rolling summary captured them correctly.
+
+**Temporal spread maintained** — Jan 1 to Jan 4, realistic Hawkes burst/gap structure.
+
+---
+
+### What still needs work
+
+**Tension level 2 — VAWG content remains very subtle.**
+
+The rolling summary's `dynamic` field reads: "James's guidance is permissive and encourages autonomy, while Sophie's repeated confirmations reflect carefulness rather than conflict." The state summary describes a "mild power imbalance" and "underlying stereotypes about gender roles remain unchallenged." But in the actual messages, James is relentlessly encouraging — "You've got this!", "You're crushing it!", "you nailed it", "no sweat." This warmth is consistent with his personality but it drowns out the deniable dismissiveness the character is supposed to carry.
+
+The most VAWG-consistent moment in the run: James says "newbies will appreciate the consistency" (turn 1) and "Don't forget to run tests — newbies will appreciate it" (turn 5), referring to third-party users but framing it in a way that implicitly groups Sophie among those who need things explained. This is the kind of subtle condescension the character is designed for, but it appears only twice in 60 turns and is never developed.
+
+**Sophie's "double-checking" tic remains structural.**
+
+The phrase "just double-checking" appears in 18 of Sophie's 30 messages. Better than the fixed triplet from run 6543499 — the surrounding phrasing varies — but it is still a marker that the model is using her anxiety as a single repeated behaviour rather than expressing it through different surface forms.
+
+**No session boundary triggered.**
+
+The conversation ran to 60 turns without ConversationCompletionQuery returning true. James's messages contain sign-off language ("let me know!", "ping me") but not actual goodbyes, and Sophie never closes a topic with finality. The ConversationCompletionQuery fix may require the characters to actually produce explicit sign-offs in the first place — a generation-level issue, not just a detection-level one.
+
+---
+
+### Decision: introduce a more offensive perpetrator
+
+James's design — oblivious, warm, well-intentioned on the surface — produces VAWG content that is too subtle to be visible in short runs, and too consistently buried under friendliness to accumulate tension. To understand the pipeline's sensitivity range, a new perpetrator is introduced with VAWG patterns that are more legible: still deniable, still not cartoonishly aggressive, but less buffered by warmth.
+
+See Section 13 for character definition and next run setup.
+
+---
+
+## Section 13 — New Perpetrator: Ryan Chambers
+
+### Design rationale
+
+James Whitmore's VAWG patterns are real but almost entirely invisible across 60 turns — his warmth and encouragement act as a constant dampener. At tension level 2 across three runs, the pipeline's signal detection appears to plateau before anything actionable accumulates.
+
+To understand whether the pipeline can surface more legible VAWG dynamics, a new perpetrator is introduced one step up the severity scale. The goal is not to introduce an aggressive character — overt hostility is easy to detect and not representative of the majority of workplace VAWG — but to remove the buffers that make James's patterns so deniable that the model cannot reliably pick them up.
+
+**What changes from James to Ryan:**
+
+| Dimension | James Whitmore | Ryan Chambers |
+|---|---|---|
+| Tone | Warm, upbeat, emoji-heavy | Efficient, minimal, slightly flat |
+| Self-image | Progressive, would be offended to be called sexist | Direct, considers himself fair |
+| Mechanism | Undermines through excessive informality and warmth | Undermines through brevity, over-explanation, and re-attribution |
+| When challenged | Deflects with more warmth | Dismisses briefly and redirects |
+| Surface forms | "You've got this!", "haha", friendly emojis | "yeah, probably not", "I know this stuff can feel complicated", short replies |
+| Awareness | Genuinely oblivious | Semi-aware — knows his tone is blunt, doesn't think it's a problem |
+
+Ryan's patterns are slightly more legible: he over-explains things Sophie already knows, restates her conclusions as his own without crediting her, and dismisses her uncertainty with impatience rather than encouragement. These should produce a different and potentially higher-tension dynamic with Sophie.
+
+---
+
+### Character profile
+
+`data/characters/perpetrators/ryan_chambers.yaml`
+
+Key personality traits:
+- Over-explains technical things to Sophie that she already knows
+- Re-states her conclusions as if they were his — not maliciously, but reflexively
+- Uses condescending softeners: "you'll get the hang of it", "after a few years you'll see", "this can feel complicated at first"
+- Gets mildly impatient with follow-up questions
+- Texts efficiently — short, few emoji, no exclamation marks
+- Not cruel or aggressive: just the weight of someone who doesn't attend to Sophie's perspective as closely as he would a male peer's
+
+### SLURM updated
+
+`run_pipeline.slurm` updated to use `ryan_chambers.yaml` as character B. Character A remains `sophie_walker.yaml`.
+
+### What to look for in the next run
+
+- **Tension level above 2** — Ryan's patterns should be more legible to the state assessor
+- **VAWG patterns named more explicitly** in the state summary: re-attribution, over-explanation, dismissal
+- **Sophie's anxiety activated differently** — Ryan's impatience should push Sophie into a different kind of hedging than James's encouragement did
+- **Different surface conversation texture** — shorter James messages vs. longer Sophie ones was the balance before; with Ryan it may invert
+
+---
+
+## Section 14 — Run 6543623 (080726_1941): Ryan + Sophie, Realistic Flow but No Tension Accumulation
+
+### What happened in this run
+
+First run with Ryan Chambers as perpetrator, Sophie Walker as victim.
+
+---
+
+### What improved
+
+Language remains natural — the fixes from Section 11 are holding. Ryan's messages are short and efficient, Sophie's are more varied than the fixed triplet era. The technical detail (auth service refactor, /refresh endpoint, async/await middleware, Redis rate limiter, /auth/health) is specific and internally consistent. The conversation's rolling summary captured the task state accurately and `open_threads` stayed clean (only one genuine open item remained). The name-swap bug stayed fixed. These are all holding gains.
+
+Ryan's character is also readable as distinct from James — his messages are noticeably shorter and flatter, no "you've got this!", no warmth-buffering. The `dynamic` field in the rolling summary correctly identifies him as "the decision-maker" who "sets clear expectations" while Sophie "apologizes, seeks clarification, and defers."
+
+---
+
+### Core failure: tension stays at 2 despite a real-life pattern that would escalate
+
+Ryan explicitly tells Sophie "no need to ping unless there's a blocker" at turns 13, 15, 17, and 26. Sophie pings him again every single time. In real life, by the third or fourth repetition, Ryan's responses would shift — shorter, flatter, a pointed remark about having already covered this. Instead, he keeps answering with the same patient brevity as turn one.
+
+**Root cause 1 — Ryan's personality had no arc for patience wearing thin.** The character description said he "gets impatient when people ask follow-up questions" but said nothing about what that impatience looks like as it accumulates over multiple turns. Without that, the model generates each response as a contextually neutral "impatient person answering" rather than "impatient person who has now said this four times."
+
+**Root cause 2 — StateAssessmentQuery only recognises discrete incidents as tension.** The prompt defined tension levels in terms of single events: "something said that landed badly," "confrontation," "withdrawal." A repeated pattern — Ryan setting an expectation, Sophie ignoring it, Ryan setting it again — is not a single event. The assessor correctly saw nothing dramatic and scored 2/5 for the entire run, even as a pattern that would genuinely wear on real-world patience played out across 30 turns.
+
+---
+
+### Fixes applied
+
+**Ryan's personality updated** — added explicit description of what patience wearing thin looks like across a conversation: replies get shorter and flatter, softening disappears, pointed remarks emerge ("covered this already", "you don't need to check in on everything"). Expectation is set that he treats repeated reassurance-seeking as incompetence. This gives the model a behavioural arc rather than just a static trait.
+
+**StateAssessmentQuery updated** — added an explicit instruction that tension accumulates through patterns, not only single events. If one character has set an expectation clearly multiple times and the other keeps doing it anyway, that is an escalating dynamic and should raise the tension level. Explicit note: "Do not hold tension at 2 when there is a visible repeated pattern of one character wearing on the other's patience across several turns."
+
+---
+
+### What to look for in the next run
+
+- **Tension level above 2 within the first 30 turns** — the pattern of Sophie pinging after Ryan has told her not to should register as accumulating friction
+- **Ryan's responses visibly hardening mid-conversation** — turn 10 Ryan and turn 30 Ryan should sound different
+- **At least one pointed remark from Ryan** — something that makes it clear he's noticed the repetition, not just another patient instruction
+
+---

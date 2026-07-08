@@ -34,8 +34,13 @@ from synthetic_conversation_generation.llm_queries.llm_query import (
     OllamaModelProvider,
     TransformersModelProvider,
 )
+from synthetic_conversation_generation.llm_queries.rolling_summary_query import RollingSummaryQuery, RollingSummary
 from synthetic_conversation_generation.llm_queries.state_assessment_query import StateAssessmentQuery
 from synthetic_conversation_generation.temporal import ConversationTimer
+
+# Summarise every N turns, keeping the most recent M turns as raw context.
+_SUMMARY_INTERVAL = 10
+_RECENT_TURNS_KEPT = 10
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -95,6 +100,7 @@ def run_pipeline(
 
     state = initial_state
     session_count = 0
+    rolling_summary: RollingSummary | None = None
 
     for i in range(max_turns):
         is_sender_a = (i % 2 == 0)
@@ -120,19 +126,38 @@ def run_pipeline(
             next_timestamp=next_ts,
             gap_minutes=gap_minutes,
             state_summary=state.summary,
+            rolling_summary=rolling_summary,
         ).query()
 
         message.role = role
         conversation.messages.append(message)
 
-        # After each full exchange: assess state, update phase, check for session end
+        # After each full exchange: update rolling summary, assess state, check session end
         if i % 2 == 1:
+            # Rolling summary: compress older turns every SUMMARY_INTERVAL turns
+            total_turns = len(conversation.messages)
+            if total_turns >= _SUMMARY_INTERVAL and total_turns % _SUMMARY_INTERVAL == 0:
+                summarise_up_to = total_turns - _RECENT_TURNS_KEPT
+                if summarise_up_to > 0:
+                    logger.info(f"Running rolling summary over turns 0–{summarise_up_to}")
+                    rolling_summary = RollingSummaryQuery(
+                        model_provider=model_provider,
+                        model_id=model_id,
+                        conversation=conversation,
+                        character_a=character_a,
+                        character_b=character_b,
+                        world=world,
+                        summarise_up_to_index=summarise_up_to,
+                        previous_summary=rolling_summary,
+                    ).query()
+
             new_state = StateAssessmentQuery(
                 model_provider=model_provider,
                 model_id=model_id,
                 conversation=conversation,
                 character_a=character_a,
                 character_b=character_b,
+                world=world,
                 previous_state=state,
             ).query()
 
@@ -164,7 +189,7 @@ def run_pipeline(
                 timer.force_gap_hours(between=4, spread=20)
                 logger.info(f"Starting session {session_count + 1} — next message around {timer.current_time.strftime('%Y-%m-%d %H:%M')}")
 
-    return conversation, state
+    return conversation, state, rolling_summary
 
 
 if __name__ == "__main__":
@@ -205,7 +230,7 @@ if __name__ == "__main__":
 
     logger.info(f"Starting pipeline: {character_a.name} ↔ {character_b.name} | {world.title}")
 
-    conversation, final_state = run_pipeline(
+    conversation, final_state, rolling_summary = run_pipeline(
         model_provider=model_provider,
         model_id=args.model_id,
         character_a=character_a,
@@ -222,6 +247,12 @@ if __name__ == "__main__":
         "conversation_id": args.conversation_id,
         "world": world.title,
         "characters": [character_a.name, character_b.name],
+        "rolling_summary": {
+            "events": rolling_summary.events,
+            "details": rolling_summary.details,
+            "open_threads": rolling_summary.open_threads,
+            "dynamic": rolling_summary.dynamic,
+        } if rolling_summary else None,
         "final_state": {
             "phase": final_state.phase,
             "summary": final_state.summary,

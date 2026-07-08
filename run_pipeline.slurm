@@ -52,8 +52,8 @@ apptainer exec --nv \
 
 # ── Run the pipeline ──────────────────────────────────────────────────────────
 ${PYTHON} -m synthetic_conversation_generation.pipeline \
-    --character-a data/characters/victims/priya_sharma.yaml \
-    --character-b data/characters/perpetrators/james_whitmore.yaml \
+    --character-a data/characters/victims/sophie_walker.yaml \
+    --character-b data/characters/perpetrators/ryan_chambers.yaml \
     --world data/worlds/uk_tech_company.yaml \
     --model-provider ollama \
     --model-id gpt-oss:20b \

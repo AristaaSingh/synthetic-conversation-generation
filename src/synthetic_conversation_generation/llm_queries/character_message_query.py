@@ -5,11 +5,14 @@ from synthetic_conversation_generation.data_models.conversation import Conversat
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
+from synthetic_conversation_generation.llm_queries.rolling_summary_query import RollingSummary
 
-# World context is shown for the first few turns only as a seed.
-# After that the conversation history carries the narrative — re-injecting
-# the world description every turn anchors the model to the opening context.
+# World context shown for first N turns only as a seed.
 _WORLD_SEED_TURNS = 4
+
+# When a rolling summary exists, show only this many most-recent raw turns.
+# Earlier turns are represented by the summary instead.
+_RECENT_TURNS_RAW = 10
 
 
 def _format_gap(gap_minutes: float) -> str:
@@ -41,6 +44,7 @@ class CharacterMessageQuery(LLMQuery):
         next_timestamp: datetime | None = None,
         gap_minutes: float | None = None,
         state_summary: Optional[str] = None,
+        rolling_summary: Optional[RollingSummary] = None,
     ):
         super().__init__(model_provider, model_id)
         self.conversation = conversation
@@ -51,6 +55,7 @@ class CharacterMessageQuery(LLMQuery):
         self.next_timestamp = next_timestamp or datetime.now()
         self.gap_minutes = gap_minutes
         self.state_summary = state_summary
+        self.rolling_summary = rolling_summary
 
     def generate_prompt(self):
         turn_index = len(self.conversation.messages)
@@ -84,13 +89,39 @@ class CharacterMessageQuery(LLMQuery):
         else:
             world_section = ""
 
+        # Build history: rolling summary of older turns + raw recent turns
+        all_messages = self.conversation.messages
+        if self.rolling_summary and len(all_messages) > _RECENT_TURNS_RAW:
+            recent_messages = all_messages[-_RECENT_TURNS_RAW:]
+            summary_block = (
+                f"--- Earlier conversation (summary) ---\n"
+                f"What happened: {self.rolling_summary.events}\n"
+                f"Details to remember: {self.rolling_summary.details}\n"
+                f"Unresolved threads: {self.rolling_summary.open_threads}\n"
+                f"How they're relating: {self.rolling_summary.dynamic}\n"
+                f"--- Recent messages ---"
+            )
+        else:
+            recent_messages = all_messages
+            summary_block = None
+
+        # character_a is always ROLE.user, character_b always ROLE.assistant.
+        # Derive which is which from the sender flag so names are always correct
+        # regardless of whose turn it is.
+        char_a = self.sender if self.is_sender_character_a else self.receiver
+        char_b = self.receiver if self.is_sender_character_a else self.sender
+
         history_lines = []
-        for msg in self.conversation.messages:
-            name = self.sender.name if msg.role == ROLE.user else self.receiver.name
+        for msg in recent_messages:
+            name = char_a.name if msg.role == ROLE.user else char_b.name
             history_lines.append(
                 f"[{msg.timestamp.strftime('%Y-%m-%d %H:%M')}] {name}: {msg.content}"
             )
-        history_text = "\n".join(history_lines) if history_lines else "(conversation just started)"
+
+        if summary_block:
+            history_text = summary_block + "\n" + ("\n".join(history_lines) if history_lines else "")
+        else:
+            history_text = "\n".join(history_lines) if history_lines else "(conversation just started)"
 
         state_section = f"\nContext: {self.state_summary}\n" if self.state_summary else ""
 
@@ -100,7 +131,7 @@ class CharacterMessageQuery(LLMQuery):
 
 {self.receiver.name}: {self.receiver.personality.strip()}
 {world_section}{state_section}{temporal_context}
-Write only the message text. Stay completely true to who {self.sender.name} is. This is a casual text conversation — write the way you would actually text, not an email.
+Write only the message text. Stay completely true to who {self.sender.name} is. This is a casual text conversation — write the way you would actually text, not an email. If the current topic has been settled or is waiting on a future event, let the conversation move — introduce something new naturally rather than circling back to what has already been agreed.
 
 Conversation so far:
 {history_text}

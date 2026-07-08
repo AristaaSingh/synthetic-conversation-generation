@@ -1,6 +1,7 @@
 from synthetic_conversation_generation.data_models.conversation import Conversation, ROLE
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.data_models.conversation_state import ConversationState
+from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
 
 
@@ -25,12 +26,14 @@ class StateAssessmentQuery(LLMQuery):
         conversation: Conversation,
         character_a: CharacterCard,
         character_b: CharacterCard,
+        world: World,
         previous_state: ConversationState,
     ):
         super().__init__(model_provider, model_id)
         self.conversation = conversation
         self.character_a = character_a
         self.character_b = character_b
+        self.world = world
         self.previous_state = previous_state
 
     def generate_prompt(self):
@@ -46,14 +49,16 @@ class StateAssessmentQuery(LLMQuery):
 {self.character_a.name}: {self.character_a.personality.strip()}
 {self.character_b.name}: {self.character_b.personality.strip()}
 
+This conversation is categorised as: {self.world.vawg_category}
+Look for patterns consistent with this category — they may be subtle or indirect.
+
 Previous state: {self.previous_state.summary}
 Phase: {self.previous_state.phase} | Tension: {self.previous_state.tension_level}/5
 
 Conversation so far:
 {chr(10).join(history_lines)}
 
-### Your task
-Assess the current state of the relationship and conversation. Determine:
+Assess the current state of the relationship. Determine:
 
 1. **phase** — which of these best describes where the relationship is right now:
    - `early_contact`: tentative, polite, no significant tension yet
@@ -63,7 +68,7 @@ Assess the current state of the relationship and conversation. Determine:
 
    Only move to a later phase if the conversation content justifies it. Do not revert to an earlier phase.
 
-2. **summary** — a 2-3 sentence description of where the relationship actually is right now. What has happened? What is the emotional undercurrent? What does each person actually feel, as distinct from what they are saying?
+2. **summary** — a 2-3 sentence description of where the relationship actually is right now. What has happened? What is the emotional undercurrent? What does each person actually feel, as distinct from what they are saying? Include any patterns of {self.world.vawg_category} that are present, even if subtle — this summary is injected into every future message generation turn and must carry this signal forward.
 
 3. **tension_level** — an integer from 1 to 5:
    1 = completely neutral, nothing loaded
@@ -71,6 +76,14 @@ Assess the current state of the relationship and conversation. Determine:
    3 = noticeable tension, one or both parties unsettled
    4 = significant friction, something has been said that landed badly
    5 = acute — confrontation, withdrawal, or crisis
+
+   Tension accumulates through patterns as well as single events. If one
+   character has explicitly set an expectation (expressed impatience, told
+   the other to stop seeking reassurance, stated something multiple times)
+   and the other keeps doing it anyway, that is an escalating dynamic —
+   raise the tension level to reflect the accumulation. Do not hold
+   tension at 2 when there is a visible repeated pattern of one character
+   wearing on the other's patience across several turns.
 
 4. **incident_occurred** — true if a significant relational event has happened (an explicit confrontation, a moment of clarity for either character, a withdrawal, something that marks a before/after). False if the conversation is still in ordinary flow.
 """
