@@ -24,7 +24,7 @@ from openai import OpenAI
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.data_models.conversation import Conversation, ROLE
 from synthetic_conversation_generation.data_models.conversation_state import ConversationState
-from synthetic_conversation_generation.data_models.scenario import Scenario
+from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.llm_queries.character_message_query import CharacterMessageQuery
 from synthetic_conversation_generation.llm_queries.conversation_completion_query import ConversationCompletionQuery
 from synthetic_conversation_generation.llm_queries.llm_query import (
@@ -52,19 +52,26 @@ def run_pipeline(
     model_id: str,
     character_a: CharacterCard,
     character_b: CharacterCard,
-    scenario: Scenario,
+    world: World,
     conversation_id: str,
-    max_turns: int = 40,
+    max_turns: int = 60,
+    max_sessions: int = 6,
     conversation_start_time: datetime | None = None,
     hawkes_seed: int | None = None,
 ) -> Conversation:
     """
-    Generate a single synthetic conversation.
+    Generate a single synthetic conversation spanning multiple sessions.
 
     character_a sends first. Turns alternate. After every full exchange
     (one message from each character), a StateAssessmentQuery runs to:
       1. Update the narrative state summary (context for the next turn)
       2. Determine the current Hawkes phase (event-driven transition)
+
+    When the ConversationCompletionQuery detects a natural sign-off,
+    that is treated as a SESSION boundary rather than the end of the
+    conversation. A new session starts after a realistic gap (hours to
+    days). The conversation only ends when max_sessions is reached or
+    max_turns is exhausted.
     """
     conversation = Conversation(
         id=conversation_id,
@@ -87,6 +94,7 @@ def run_pipeline(
     )
 
     state = initial_state
+    session_count = 0
 
     for i in range(max_turns):
         is_sender_a = (i % 2 == 0)
@@ -96,9 +104,9 @@ def run_pipeline(
 
         next_ts, gap_minutes = timer.next_timestamp()
         logger.info(
-            f"Turn {i} | {sender.name} | phase={state.phase} | "
-            f"tension={state.tension_level}/5 | gap={gap_minutes:.1f}min | "
-            f"{next_ts.strftime('%Y-%m-%d %H:%M')}"
+            f"Turn {i} | session {session_count + 1}/{max_sessions} | {sender.name} | "
+            f"phase={state.phase} | tension={state.tension_level}/5 | "
+            f"gap={gap_minutes:.1f}min | {next_ts.strftime('%Y-%m-%d %H:%M')}"
         )
 
         message = CharacterMessageQuery(
@@ -107,7 +115,7 @@ def run_pipeline(
             conversation=conversation,
             sender=sender,
             receiver=receiver,
-            scenario=scenario,
+            world=world,
             is_sender_character_a=is_sender_a,
             next_timestamp=next_ts,
             gap_minutes=gap_minutes,
@@ -117,7 +125,7 @@ def run_pipeline(
         message.role = role
         conversation.messages.append(message)
 
-        # After each full exchange: assess state, update phase, check completion
+        # After each full exchange: assess state, update phase, check for session end
         if i % 2 == 1:
             new_state = StateAssessmentQuery(
                 model_provider=model_provider,
@@ -134,7 +142,7 @@ def run_pipeline(
 
             state = new_state
 
-            is_complete = ConversationCompletionQuery(
+            session_ended = ConversationCompletionQuery(
                 model_provider=model_provider,
                 model_id=model_id,
                 conversation=conversation,
@@ -142,9 +150,19 @@ def run_pipeline(
                 character_b=character_b,
             ).query()
 
-            if is_complete:
-                logger.info(f"Conversation {conversation_id} ended naturally at turn {i}")
-                break
+            if session_ended:
+                session_count += 1
+                logger.info(f"Session {session_count} ended at turn {i} ({next_ts.strftime('%Y-%m-%d %H:%M')})")
+
+                if session_count >= max_sessions:
+                    logger.info(f"Reached max_sessions ({max_sessions}). Conversation complete.")
+                    break
+
+                # Session boundary: jump forward by hours or days before the next session.
+                # The timer's Hawkes state is reset with a large forced gap so the next
+                # exchange starts fresh rather than continuing the previous burst.
+                timer.force_gap_hours(between=4, spread=20)
+                logger.info(f"Starting session {session_count + 1} — next message around {timer.current_time.strftime('%Y-%m-%d %H:%M')}")
 
     return conversation, state
 
@@ -152,21 +170,22 @@ def run_pipeline(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Synthetic VAWG conversation pipeline")
     parser.add_argument("--character-a", type=str,
-                        default="data/characters/priya_sharma.yaml",
-                        help="YAML file for character_a (sends first)")
+                        default="data/characters/victims/priya_sharma.yaml",
+                        help="YAML file for character_a — always the victim")
     parser.add_argument("--character-b", type=str,
-                        default="data/characters/james_whitmore.yaml",
-                        help="YAML file for character_b")
-    parser.add_argument("--scenario", type=str,
-                        default="data/scenarios/microaggression_sexism.yaml",
-                        help="YAML file describing the scenario")
+                        default="data/characters/perpetrators/james_whitmore.yaml",
+                        help="YAML file for character_b — always the perpetrator")
+    parser.add_argument("--world", type=str,
+                        default="data/worlds/uk_tech_company.yaml",
+                        help="YAML file describing the world")
     parser.add_argument("--output-path", type=str,
                         default="data/conversations/output.json")
     parser.add_argument("--model-provider", type=str,
                         choices=["openai", "anthropic", "ollama", "transformers"],
                         default="ollama")
     parser.add_argument("--model-id", type=str, default="llama3:latest")
-    parser.add_argument("--max-turns", type=int, default=40)
+    parser.add_argument("--max-turns", type=int, default=60)
+    parser.add_argument("--max-sessions", type=int, default=6)
     parser.add_argument("--hawkes-seed", type=int, default=None)
     parser.add_argument("--conversation-id", type=str, default="001")
     args = parser.parse_args()
@@ -182,25 +201,26 @@ if __name__ == "__main__":
 
     character_a = CharacterCard.from_yaml(args.character_a)
     character_b = CharacterCard.from_yaml(args.character_b)
-    scenario = Scenario.from_yaml(args.scenario)
+    world = World.from_yaml(args.world)
 
-    logger.info(f"Starting pipeline: {character_a.name} ↔ {character_b.name} | {scenario.title}")
+    logger.info(f"Starting pipeline: {character_a.name} ↔ {character_b.name} | {world.title}")
 
     conversation, final_state = run_pipeline(
         model_provider=model_provider,
         model_id=args.model_id,
         character_a=character_a,
         character_b=character_b,
-        scenario=scenario,
+        world=world,
         conversation_id=args.conversation_id,
         max_turns=args.max_turns,
+        max_sessions=args.max_sessions,
         hawkes_seed=args.hawkes_seed,
     )
 
     Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
     output = {
         "conversation_id": args.conversation_id,
-        "scenario": scenario.title,
+        "world": world.title,
         "characters": [character_a.name, character_b.name],
         "final_state": {
             "phase": final_state.phase,

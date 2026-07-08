@@ -1,5 +1,3 @@
-import json
-
 from synthetic_conversation_generation.data_models.conversation import Conversation, ROLE
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.data_models.conversation_state import ConversationState
@@ -39,25 +37,20 @@ class StateAssessmentQuery(LLMQuery):
         history_lines = []
         for msg in self.conversation.messages:
             name = self.character_a.name if msg.role == ROLE.user else self.character_b.name
-            history_lines.append({
-                "speaker": name,
-                "timestamp": msg.timestamp.strftime("%Y-%m-%d %H:%M"),
-                "message": msg.content,
-            })
+            history_lines.append(
+                f"[{msg.timestamp.strftime('%Y-%m-%d %H:%M')}] {name}: {msg.content}"
+            )
 
         return f"""You are analysing the current state of a text message conversation between two people.
 
-### Characters
-{self.character_a.name}: {self.character_a.summary.strip()}
-{self.character_b.name}: {self.character_b.summary.strip()}
+{self.character_a.name}: {self.character_a.personality.strip()}
+{self.character_b.name}: {self.character_b.personality.strip()}
 
-### Previous state summary
-{self.previous_state.summary}
-Previous phase: {self.previous_state.phase}
-Previous tension level: {self.previous_state.tension_level}/5
+Previous state: {self.previous_state.summary}
+Phase: {self.previous_state.phase} | Tension: {self.previous_state.tension_level}/5
 
-### Conversation so far
-{json.dumps(history_lines, indent=2)}
+Conversation so far:
+{chr(10).join(history_lines)}
 
 ### Your task
 Assess the current state of the relationship and conversation. Determine:

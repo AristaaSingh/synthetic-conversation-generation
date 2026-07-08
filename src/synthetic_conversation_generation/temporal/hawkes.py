@@ -211,6 +211,30 @@ class ConversationTimer:
         timestamp = self.start_time + timedelta(minutes=self._current_time_minutes)
         return timestamp, gap_minutes
 
+    def force_gap_hours(self, between: float = 4, spread: float = 20) -> None:
+        """
+        Jump the clock forward by a random gap to simulate a session boundary.
+
+        Used when one conversation session has ended (e.g. "talk later") and
+        a new session is about to begin. The gap is sampled uniformly from
+        [between, between + spread] hours. The event history is cleared so the
+        next session's Hawkes excitation starts fresh rather than as a
+        continuation of the previous burst.
+
+        Args:
+            between: Minimum gap in hours (default 4 — later that evening).
+            spread:  Additional random hours added on top (default 20 — up to ~a day later).
+        """
+        gap_hours = between + self._rng.uniform(0, spread)
+        gap_minutes = gap_hours * 60
+        self._current_time_minutes += gap_minutes
+        self._event_history = []  # fresh start for next session's excitation
+
+    @property
+    def current_time(self) -> datetime:
+        """Current datetime of the conversation clock."""
+        return self.start_time + timedelta(minutes=self._current_time_minutes)
+
     @property
     def elapsed_days(self) -> float:
         """Total days elapsed since the start of the conversation."""

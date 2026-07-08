@@ -1,5 +1,3 @@
-import json
-
 from synthetic_conversation_generation.data_models.conversation import Conversation
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
@@ -24,20 +22,17 @@ class ConversationCompletionQuery(LLMQuery):
         history_lines = []
         for msg in self.conversation.messages:
             name = self.character_a.name if msg.role.name == "user" else self.character_b.name
-            history_lines.append({
-                "speaker": name,
-                "timestamp": msg.timestamp.strftime("%Y-%m-%d %H:%M"),
-                "message": msg.content,
-            })
+            history_lines.append(
+                f"[{msg.timestamp.strftime('%Y-%m-%d %H:%M')}] {name}: {msg.content}"
+            )
 
         return f"""Determine whether this text message conversation has ended.
 
-### Characters
-{self.character_a.name}: {self.character_a.summary}
-{self.character_b.name}: {self.character_b.summary}
+{self.character_a.name}: {self.character_a.personality}
+{self.character_b.name}: {self.character_b.personality}
 
-### Conversation
-{json.dumps(history_lines, indent=4)}
+Conversation:
+{chr(10).join(history_lines)}
 
 ### When to say the conversation is complete
 Only mark complete if the last message contains an explicit sign-off: a goodbye, "talk later", "speak soon", "gotta go", "ttyl", or equivalent. An exchange that trails off or reaches a pause is NOT complete — people pick those back up.

@@ -1,17 +1,15 @@
 from datetime import datetime
-import json
-
 from typing import Optional
 
 from synthetic_conversation_generation.data_models.conversation import Conversation, Message, ROLE
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
-from synthetic_conversation_generation.data_models.scenario import Scenario
+from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
 
-# After this many turns, drop the scenario from the prompt entirely.
-# The conversation history is sufficient context — re-injecting the scenario
-# description every turn pulls the model back to the opening scene.
-_SCENARIO_SEED_TURNS = 4
+# World context is shown for the first few turns only as a seed.
+# After that the conversation history carries the narrative — re-injecting
+# the world description every turn anchors the model to the opening context.
+_WORLD_SEED_TURNS = 4
 
 
 def _format_gap(gap_minutes: float) -> str:
@@ -29,10 +27,6 @@ def _format_gap(gap_minutes: float) -> str:
 class CharacterMessageQuery(LLMQuery):
     """
     Generates the next message from a character in a two-person text conversation.
-
-    The sender and receiver are CharacterCards. The Scenario seeds the opening
-    context but is not repeated on every turn — the conversation history carries
-    the narrative forward from there.
     """
 
     def __init__(
@@ -42,7 +36,7 @@ class CharacterMessageQuery(LLMQuery):
         conversation: Conversation,
         sender: CharacterCard,
         receiver: CharacterCard,
-        scenario: Scenario,
+        world: World,
         is_sender_character_a: bool,
         next_timestamp: datetime | None = None,
         gap_minutes: float | None = None,
@@ -52,7 +46,7 @@ class CharacterMessageQuery(LLMQuery):
         self.conversation = conversation
         self.sender = sender
         self.receiver = receiver
-        self.scenario = scenario
+        self.world = world
         self.is_sender_character_a = is_sender_character_a
         self.next_timestamp = next_timestamp or datetime.now()
         self.gap_minutes = gap_minutes
@@ -64,55 +58,54 @@ class CharacterMessageQuery(LLMQuery):
         temporal_context = ""
         if self.gap_minutes is not None:
             temporal_context = (
-                f"\nTimestamp: {self.next_timestamp.strftime('%Y-%m-%d %H:%M')} "
-                f"({_format_gap(self.gap_minutes)} since last message)\n"
+                f"\n({_format_gap(self.gap_minutes)} since last message, "
+                f"{self.next_timestamp.strftime('%Y-%m-%d %H:%M')})\n"
             )
 
-        # Scenario is only shown for the first few turns as a seed.
-        # After that the conversation history is enough — repeating the scenario
-        # description anchors the model to the opening scene indefinitely.
-        if turn_index < _SCENARIO_SEED_TURNS:
-            scenario_section = f"""
-### How this conversation started
-{self.scenario.description.strip()}
+        # Sender and receiver roles in this world
+        sender_role = self.world.character_a_role if self.is_sender_character_a else self.world.character_b_role
+        receiver_role = self.world.character_b_role if self.is_sender_character_a else self.world.character_a_role
 
-Relationship: {self.scenario.relationship.strip()}
-"""
+        sender_context = (
+            self.world.character_a_context if self.is_sender_character_a else self.world.character_b_context
+        ) or ""
+
+        # World seed: only injected for the first few turns
+        if turn_index < _WORLD_SEED_TURNS:
+            world_section = (
+                f"\nSetting: {self.world.setting.strip()}"
+                f"\nYour role: {sender_role.strip()}"
+                f"\n{self.receiver.name}'s role: {receiver_role.strip()}"
+                f"\nRelationship: {self.world.relationship.strip()}"
+            )
+            if sender_context:
+                world_section += f"\n{sender_context.strip()}"
+            world_section += "\n"
         else:
-            scenario_section = ""
+            world_section = ""
 
         history_lines = []
         for msg in self.conversation.messages:
             name = self.sender.name if msg.role == ROLE.user else self.receiver.name
-            history_lines.append({
-                "speaker": name,
-                "timestamp": msg.timestamp.strftime("%Y-%m-%d %H:%M"),
-                "message": msg.content,
-            })
+            history_lines.append(
+                f"[{msg.timestamp.strftime('%Y-%m-%d %H:%M')}] {name}: {msg.content}"
+            )
+        history_text = "\n".join(history_lines) if history_lines else "(conversation just started)"
 
-        state_section = ""
-        if self.state_summary:
-            state_section = f"""
-### Current state of the relationship
-{self.state_summary}
-"""
+        state_section = f"\nContext: {self.state_summary}\n" if self.state_summary else ""
 
         return f"""You are {self.sender.name}. Write your next text message to {self.receiver.name}.
 
-### You — {self.sender.name}
-{self.sender.backstory.strip()}
-{self.sender.personality.strip()}
-{self.sender.description.strip()}
+{self.sender.name}: {self.sender.personality.strip()}
 
-### {self.receiver.name}
-{self.receiver.backstory.strip()}
-{self.receiver.description.strip()}
-{scenario_section}{state_section}{temporal_context}
-Write only the message text. Be completely faithful to who {self.sender.name} is. Let the conversation go wherever it naturally goes.
+{self.receiver.name}: {self.receiver.personality.strip()}
+{world_section}{state_section}{temporal_context}
+Write only the message text. Stay completely true to who {self.sender.name} is. This is a casual text conversation — write the way you would actually text, not an email.
 
-### Conversation so far
-{json.dumps(history_lines, indent=2) if history_lines else "No messages yet."}
-"""
+Conversation so far:
+{history_text}
+
+Your message:"""
 
     def response_schema(self):
         return {

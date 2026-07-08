@@ -2,27 +2,30 @@
 #SBATCH --job-name=vawg_pipeline
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 #SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+#SBATCH --output=logs/%j.out
+#SBATCH --error=logs/%j.err
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module load apptainer
 module load miniforge
 
 PYTHON=${HOME}/.conda/envs/fyp/bin/python
-NOTIFY=${HOME}/synthetic-conversation-generation/scripts/notify.sh
+NOTIFY=scripts/notify.sh
+
+# ── Timestamp and run ID ─────────────────────────────────────────────────────
+TIMESTAMP=$(date "+%d%m%y_%H%M")
+RUN_ID="${TIMESTAMP}_${SLURM_JOB_ID}"
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-CODE_DIR=${HOME}/synthetic-conversation-generation
 OLLAMA_SIF=${SCRATCH}/ollama.sif
 OLLAMA_MODELS=${SCRATCH}/models
 CONVERSATIONS_DIR=${SCRATCH}/conversations
-ERROR_LOG=${CODE_DIR}/logs/vawg_pipeline_${SLURM_JOB_ID}.err
 
-mkdir -p ${OLLAMA_MODELS} ${CONVERSATIONS_DIR}
+# Only create subdirs we own — never attempt to create $SCRATCH itself
+mkdir -p ${OLLAMA_MODELS} ${CONVERSATIONS_DIR} logs
 
 bash ${NOTIFY} start ${SLURM_JOB_ID}
 
@@ -48,27 +51,31 @@ apptainer exec --nv \
     ${OLLAMA_SIF} ollama pull gpt-oss:20b
 
 # ── Run the pipeline ──────────────────────────────────────────────────────────
-cd ${CODE_DIR}
 ${PYTHON} -m synthetic_conversation_generation.pipeline \
-    --character-a data/characters/priya_sharma.yaml \
-    --character-b data/characters/james_whitmore.yaml \
-    --scenario data/scenarios/microaggression_sexism.yaml \
+    --character-a data/characters/victims/priya_sharma.yaml \
+    --character-b data/characters/perpetrators/james_whitmore.yaml \
+    --world data/worlds/uk_tech_company.yaml \
     --model-provider ollama \
     --model-id gpt-oss:20b \
-    --max-turns 10 \
-    --output-path ${CONVERSATIONS_DIR}/run_${SLURM_JOB_ID}.json \
-    --conversation-id ${SLURM_JOB_ID}
+    --max-turns 60 \
+    --max-sessions 6 \
+    --output-path ${CONVERSATIONS_DIR}/${RUN_ID}.json \
+    --conversation-id ${RUN_ID}
 
 EXIT_CODE=$?
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 kill ${OLLAMA_PID}
 
+# Rename log files from jobID-only to DDMMYY_HHMM_jobID format
+mv logs/${SLURM_JOB_ID}.out logs/${RUN_ID}.out 2>/dev/null || true
+mv logs/${SLURM_JOB_ID}.err logs/${RUN_ID}.err 2>/dev/null || true
+
 if [ $EXIT_CODE -eq 0 ]; then
     bash ${NOTIFY} end ${SLURM_JOB_ID}
-    echo "Done. Output saved to ${CONVERSATIONS_DIR}/run_${SLURM_JOB_ID}.json"
+    echo "Done. Output saved to ${CONVERSATIONS_DIR}/${RUN_ID}.json"
 else
-    bash ${NOTIFY} fail ${SLURM_JOB_ID} ${ERROR_LOG}
+    bash ${NOTIFY} fail ${SLURM_JOB_ID} logs/${RUN_ID}.err
     echo "Pipeline failed with exit code ${EXIT_CODE}"
     exit ${EXIT_CODE}
 fi

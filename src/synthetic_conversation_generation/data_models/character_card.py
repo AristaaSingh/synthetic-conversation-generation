@@ -1,6 +1,5 @@
-from typing import Dict
-
 from dataclasses import dataclass
+from typing import Dict
 
 import yaml
 
@@ -8,19 +7,15 @@ import yaml
 @dataclass
 class CharacterCard:
     name: str
-    backstory: str
-    description: str
+    physical_description: str
     personality: str
-    summary: str
 
     @classmethod
     def from_dict(cls, data: Dict) -> "CharacterCard":
         return cls(
             name=data["name"],
-            backstory=data.get("backstory", ""),
-            description=data.get("description", ""),
+            physical_description=data.get("physical_description", ""),
             personality=data.get("personality", ""),
-            summary=data.get("summary", ""),
         )
 
     @classmethod

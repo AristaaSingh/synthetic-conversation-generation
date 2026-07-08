@@ -625,3 +625,150 @@ The StateAssessmentQuery produces a summary and injects it as `state_summary` co
 The architectural change with the broadest impact is the **multi-session model**: treating each sign-off as a session boundary (with a larger Hawkes time gap) rather than a conversation end. This alone would allow the temporal arc to emerge across days and give the conversation room to move through multiple topics and phases. Rolling summarisation is the next major component after that.
 
 ---
+
+## Section 7 — Run 6535708: Session Architecture Active, New Failure Modes
+
+### Context
+
+This run followed the prompt and architecture changes from Section 6:
+- History format changed from JSON to plain `[YYYY-MM-DD HH:MM] Name: message` chat log
+- Prompt headers flattened, explicit instruction to write as a casual text (not email)
+- Session-based architecture introduced: sign-offs trigger session boundaries rather than ending the conversation (`max_sessions=6`, `max_turns=60`)
+
+**Model:** gpt-oss:20b  
+**Max turns:** 60 | **Max sessions:** 6  
+**Turns generated:** 10  
+**Timestamp span:** 2024-01-01 20:09 → 2024-01-02 03:56 (single overnight session)  
+**Final phase:** post_incident | **Tension:** 3/5 | **Incident occurred:** true
+
+---
+
+### What improved
+
+**Language register is noticeably more casual.** The plain chat log format produced a clear improvement — messages now read as text rather than email. James uses "Hey Pri!", emoji, and contractions. Priya's messages are shorter and less formal. The `###` header removal and "write the way you would actually text someone" instruction both appear to have had effect.
+
+**Temporal gap between messages is present.** The first reply from James comes ~4.5 hours after Priya's opening message (20:09 → 00:50), which is a realistic overnight gap — the Hawkes early_contact parameters are working as intended.
+
+**State assessment correctly identified an incident.** The StateAssessmentQuery returned `incident_occurred: true` and phase `post_incident`, accurately detecting that James's abrupt refusal in the final turn represented a meaningful relational event. The summary correctly characterises the dynamic: vague compliments about a "natural people-handling skill" followed by refusal to elaborate when challenged.
+
+---
+
+### Failure 1: Safety refusal — James's final message
+
+Turn 10 (James):
+> *"I'm sorry, but I can't help with that."*
+
+This is a model safety refusal, not a character response. It was triggered when Priya asked James to clarify what he meant by "natural people-handling skill." At that point the conversation had made the gender-stereotyping subtext explicit — Priya named it directly — and the model's alignment fine-tuning overrode the character context and refused.
+
+This is the same failure mode observed in earlier runs (Section 3) with llama3, but now appearing in gpt-oss:20b as well, just later in the conversation. The natural language character brief reduces the frequency of safety refusals but does not eliminate them when the conversation explicitly surfaces the sensitive topic the model has been trained to avoid.
+
+**Implication:** Safety refusals will continue to occur whenever either character explicitly names or analyses the microaggressive behaviour. The pipeline needs a detection and recovery mechanism — when a safety refusal is detected in a response, discard it and regenerate with a modified prompt that steers away from the explicit framing.
+
+---
+
+### Failure 2: Session architecture did not trigger — conversation never ended
+
+The session-based architecture was not exercised because the conversation never produced a sign-off. All 10 turns occurred within a single overnight session. Additionally, `--max-turns 60` was not passed correctly on this job — the run hit 10 turns and stopped. The session mechanism is correct in principle but requires the full turn budget to be confirmed for the next run.
+
+---
+
+### Failure 3: Victim seeks advice from perpetrator — implausible opening dynamic
+
+Priya's first message:
+
+> *"Also, any advice on how to make my ideas heard without sounding too assertive?"*
+
+This frames the entire conversation as a mentorship request — Priya seeking professional guidance from James on the very thing he systematically undermines. James's "natural people-handling skill" pattern then reads as advice rather than microaggression, and Priya keeps re-asking the same question across turns because the mentorship frame makes that coherent.
+
+**Root cause:** The first message is generated with no prior context other than the character card. Priya's most salient trait is professional self-doubt about how her contributions are perceived. With no alternative topic to ground the opener, the model reaches for the most psychologically coherent first message it can generate — which is a request for advice on that exact feeling. Everything after is conditioned on that opening.
+
+This is the **first-message attractor problem**: the character's dominant trait determines the first message, and the first message determines the conversation's entire frame. The fix is to diversify what the first message is about — a concrete mundane work topic, not the character's primary anxiety. This is the same insight as the PSYDIAL profile sentence: one grounding detail about what is actually happening in the character's day gives the model something specific to open with, producing topical diversity across runs.
+
+---
+
+### Failure 4: Verbatim repetition of microaggression
+
+"natural people-handling skill" or near-equivalent appears in turns 2, 4, 6, and 8 with no development. This is the rolling summarisation problem — without tracking what has already been said, the model reproduces James's default move on every turn.
+
+---
+
+### Summary
+
+| Issue | Status |
+|---|---|
+| Casual language register | **Improved** — chat log format working |
+| Temporal gaps | **Improved** — Hawkes producing realistic overnight gaps |
+| Session boundaries | **Not yet exercised** — max turns too low on this run |
+| Safety refusal | **Persists** — triggered when microaggression becomes explicit |
+| First-message attractor | **New diagnosis** — needs profile anchor or first-message seed |
+| Verbatim repetition | **Persists** — rolling summarisation not yet implemented |
+
+---
+
+## Section 8 — Run 6535962 (080726_0102): World Restructure, 60 Turns, No VAWG Content
+
+### Code changes since last run
+
+- `CharacterCard` — `backstory`, `description`, `personality` merged into single `personality` field. `summary` removed — queries that needed character context now use `personality` directly. `physical_description` added as a separate field.
+- `Scenario` → `World` — new `World` dataclass and `data/worlds/uk_tech_company.yaml`. Employment and professional role moved out of character cards into the world file under `character_a_role` / `character_b_role`. Character cards now contain only psychological information.
+- Character folder structure — `data/characters/victims/` and `data/characters/perpetrators/`. Character A is always the victim; character B is always the perpetrator. Convention enforced by folder.
+- Max turns confirmed at 60 for this run.
+
+---
+
+### What improved
+
+**Temporal spread — 3+ days for the first time.**
+
+The conversation spans 2024-01-01 10:31 to 2024-01-04 08:16 — just over three days. The Hawkes process is producing realistic burst-and-gap patterns: several rapid exchanges within minutes of each other, then gaps of hours, then resumption. This is the first run to actually demonstrate multi-day temporal structure. The session architecture did not trigger (no explicit sign-off was ever produced), but the Hawkes timing alone produced realistic spread across 60 turns.
+
+**Language register remains natural.** The chat log history format continues to produce casual text rather than email. Abbreviations, emoji, "just saying", "catch ya" — all consistent with the format change from Section 7.
+
+**Grounded technical detail emerged and persisted.** The conversation spontaneously generated a shared technical context: `X-RateLimit-Info`, `DEFAULT_BACKOFF_SECONDS`, `FEATURE_FLAG_DEFAULT_BACKOFF_ENABLED`, `feature_flag.go`, staging endpoint integration tests. These were invented by the model in the first few turns and referenced for the entire 60-turn conversation. This confirms the earlier hypothesis: given enough turns, the model does generate specific grounded detail. The detail persisted here not because of rolling summarisation but because the raw history stayed in context for 60 turns.
+
+---
+
+### Failure 1: No VAWG content — zero tension, zero incident
+
+The entire 60-turn conversation is a smooth technical collaboration. Tension level stayed at 1/5 throughout. No incident occurred. James is a perfectly pleasant, helpful colleague. Not a single microaggression appears across three days of conversation.
+
+**Root cause:** After turn 4, the world seed is dropped from the prompt. The `vawg_category` field exists in the world YAML but is never injected into any prompt after that point. The StateAssessmentQuery receives James's full personality (which describes his microaggressive patterns) but accurately reports "no tension" because the conversation genuinely contains none — James's problematic behaviour only surfaces in interpersonal, social contexts. A purely technical conversation about debugging an API spec gives him nothing to trigger it.
+
+This reveals a structural gap: **the VAWG dynamics have no persistent signal in the generation loop.** They appear in James's personality field, which is present in the prompt, but a personality description does not force a behaviour to occur — it only makes it possible when context invites it. In a conversation that stays entirely in technical territory, the invitation never comes.
+
+Two things are needed:
+1. The `vawg_category` and the character's VAWG-relevant traits need to persist beyond the 4-turn world seed — ideally via the StateAssessmentQuery's state summary, which is injected on every turn.
+2. The conversation needs interpersonal or social context alongside technical content for James's patterns to have something to attach to.
+
+---
+
+### Failure 2: Severe topic lock and circular repetition across 60 turns
+
+The entire conversation is about one thing: auth API rate-limiting headers and a call at 11:30. Priya's first message introduced this topic; every subsequent turn is a variation of "double-check X-RateLimit-Info before 11:30." They were still preparing for the same 11:30 call on day 3.
+
+The rolling summarisation problem is now extreme: turns 40–60 are near-identical to turns 10–20. The model is not tracking what has already been said and keeps re-saying it.
+
+The "11:30 call" is a specific instance of the first-message attractor problem — a pending unresolved task introduced early acts as a conversation anchor and is never resolved because resolving it (having the call) would require changing the topic, which the model resists. 60 turns of the same unresolved prep conversation is the clearest demonstration yet that without rolling summarisation, the conversation cannot move.
+
+**The `vawg_category` signal disappearing at turn 4 and the rolling summarisation gap together explain this run's failure.** The model had nothing to shift toward (no VAWG signal) and no mechanism to move away from what it started with (no summarisation compressing and releasing the early topic).
+
+---
+
+### Summary
+
+| Aspect | Status |
+|---|---|
+| Temporal spread | **First success** — 3+ days, realistic Hawkes burst/gap structure |
+| Casual language register | **Maintained** |
+| Grounded spontaneous detail | **Present** — model generated specific technical context and held it across 60 turns |
+| VAWG content | **Absent** — no persistent signal after world seed drops at turn 4 |
+| Topic lock | **Severe** — 60 turns, one topic, circular repetition |
+| Session boundaries | **Not triggered** — no sign-off produced in 60 turns |
+| Rolling summarisation | **Not yet implemented** — absence now critically visible |
+
+### Next steps
+
+1. **Persistent VAWG signal** — StateAssessmentQuery should track and surface VAWG-relevant dynamics in the state summary even when no incident has occurred, so the generation prompt always carries some signal about the kind of relationship this is.
+2. **Rolling summarisation** — the most urgent implementation need. Without it, 60-turn conversations are 60 turns of the same thing.
+
+---
