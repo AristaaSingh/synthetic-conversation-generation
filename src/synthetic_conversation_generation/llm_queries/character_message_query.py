@@ -1,8 +1,10 @@
 from datetime import datetime
 from typing import Optional
 
-from synthetic_conversation_generation.data_models.conversation import Conversation, Message, ROLE
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
+from synthetic_conversation_generation.data_models.commitment_cache import CommitmentCache
+from synthetic_conversation_generation.data_models.conversation import Conversation, Message, ROLE
+from synthetic_conversation_generation.data_models.dialogue_flow import Beat
 from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
 from synthetic_conversation_generation.llm_queries.rolling_summary_query import RollingSummary
@@ -45,6 +47,8 @@ class CharacterMessageQuery(LLMQuery):
         gap_minutes: float | None = None,
         state_summary: Optional[str] = None,
         rolling_summary: Optional[RollingSummary] = None,
+        current_beat: Optional[Beat] = None,
+        commitment_cache: Optional[CommitmentCache] = None,
     ):
         super().__init__(model_provider, model_id)
         self.conversation = conversation
@@ -56,6 +60,8 @@ class CharacterMessageQuery(LLMQuery):
         self.gap_minutes = gap_minutes
         self.state_summary = state_summary
         self.rolling_summary = rolling_summary
+        self.current_beat = current_beat
+        self.commitment_cache = commitment_cache
 
     def generate_prompt(self):
         turn_index = len(self.conversation.messages)
@@ -125,13 +131,41 @@ class CharacterMessageQuery(LLMQuery):
 
         state_section = f"\nContext: {self.state_summary}\n" if self.state_summary else ""
 
+        # Beat realisation step from SynDG (Bao et al., ACL 2023): the current
+        # beat from the pre-planned dialogue flow is injected as the topic/dynamic
+        # for this turn. The generator realises it in the character's own voice.
+        if self.current_beat:
+            beat_section = (
+                f"\nConversational beat for this turn:\n"
+                f"Topic: {self.current_beat.topic}\n"
+                f"Dynamic: {self.current_beat.description}\n"
+            )
+        else:
+            beat_section = ""
+
+        # Commitment cache injection (application-layer analogue of LMCache,
+        # Liu et al., 2025): retrieve active commitments directed at this sender
+        # and surface them as a structured memory block so they are not lost
+        # when older turns fall outside the rolling summary window.
+        commitment_section = ""
+        if self.commitment_cache is not None:
+            current_turn = len(self.conversation.messages)
+            active = self.commitment_cache.get_for_recipient(
+                self.sender.name, current_turn
+            )
+            if active:
+                lines = "\n".join(
+                    f"- {e.speaker} told you: \"{e.text}\"" for e in active
+                )
+                commitment_section = f"\nThings you have been explicitly told to do or not do:\n{lines}\nYou must respect these — do not act as if they were never said.\n"
+
         return f"""You are {self.sender.name}. Write your next text message to {self.receiver.name}.
 
 {self.sender.name}: {self.sender.personality.strip()}
 
 {self.receiver.name}: {self.receiver.personality.strip()}
-{world_section}{state_section}{temporal_context}
-Write only the message text. Stay completely true to who {self.sender.name} is. This is a casual text conversation — write the way you would actually text, not an email. If the current topic has been settled or is waiting on a future event, let the conversation move — introduce something new naturally rather than circling back to what has already been agreed.
+{world_section}{state_section}{beat_section}{commitment_section}{temporal_context}
+Write only the message text. Stay completely true to who {self.sender.name} is. This is a casual text conversation — write the way you would actually text, not an email. Realise the conversational beat above in your own voice; do not quote or paraphrase it directly.
 
 Conversation so far:
 {history_text}

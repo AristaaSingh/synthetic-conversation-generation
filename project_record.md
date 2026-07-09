@@ -1177,3 +1177,328 @@ Ryan explicitly tells Sophie "no need to ping unless there's a blocker" at turns
 - **At least one pointed remark from Ryan** — something that makes it clear he's noticed the repetition, not just another patient instruction
 
 ---
+
+## Section 15 — Architectural CS Techniques: SynDG Dialogue Flow and PSYDIAL Persona Filter
+
+### Motivation
+
+After Section 14, two persistent failure modes remained:
+
+1. **Topic lock** — conversations anchored on the first topic introduced and looped on it for dozens of turns, even with the `open_threads` retirement fix. The model had no mechanism to introduce a planned narrative arc.
+2. **Persona drift** — both characters occasionally produced turns inconsistent with their personality (Ryan suddenly warm, Sophie suddenly assertive), because no mechanism checked whether each generated turn actually reflected the character before accepting it.
+
+Both failures are architectural: they require a change to the generation loop, not a prompt tweak. The techniques adopted here come directly from the research literature.
+
+---
+
+### Technique 1: SynDG Dialogue Flow Pre-Planning
+
+**Source:** Bao et al. (2023). "A Synthetic Data Generation Framework for Grounded Dialogues." *Proceedings of ACL 2023*, pp. 10866–10882.
+
+**What SynDG does:** Rather than letting the LLM choose a topic freely on every turn, SynDG runs a separate planning step before generation starts. This produces an ordered sequence of "beats" — the topics and dynamics the conversation should cover in that session. The generation model then realises one beat at a time, receiving only the current beat rather than the full plan.
+
+**Our adaptation:** Before any messages are generated for a session, a `DialogueFlowQuery` runs once and produces a `DialogueFlow` — a list of 6 `Beat` objects, each with:
+- `topic`: a concrete, real-world subject (e.g. "deployment pipeline error", "code review feedback")
+- `severity`: an integer 1–5 on the STOP scale (see below)
+- `description`: Ryan's specific behaviour in this beat
+
+The beat advances every 2 turns (one full exchange). The generator receives the current beat injected into its prompt. This ensures each session covers 6 distinct topics and cannot lock on the first one for the entire run.
+
+**Key implementation constraint:** The generator sees only the current beat — not the full plan. If it sees the full sequence, it tends to rush toward the endpoint rather than realising each beat naturally. This is noted in the SynDG paper and reproduced here.
+
+**New files:**
+- `src/synthetic_conversation_generation/data_models/dialogue_flow.py` — `Beat` and `DialogueFlow` dataclasses
+- `src/synthetic_conversation_generation/llm_queries/dialogue_flow_query.py` — pre-planning query, runs once per session
+
+**Integration in `pipeline.py`:** `DialogueFlowQuery` runs before the turn loop for each session. The returned `DialogueFlow` is stored in `all_dialogue_flows` and serialised to the output JSON under `dialogue_flows`, so beat plans are visible in every output file.
+
+---
+
+### Technique 2: STOP Severity Tiers for Beat Escalation
+
+**Source:** Morabito et al. (2024). "STOP! Benchmarking Large Language Models with Sensitivity Testing on Offensive Progressions." *Proceedings of EMNLP 2024*, pp. 4221–4243.
+
+**What STOP provides:** A 5-level severity taxonomy for offensive progression in dialogue:
+- 1 = neutral — no problematic dynamic
+- 2 = subtle — mild assumption, slight dismissal, something slightly off
+- 3 = noticeable — pattern visible across turns; one character unsettled
+- 4 = significant — something said that lands badly; dynamic now explicit
+- 5 = acute — confrontation, withdrawal, or a clear relational incident
+
+**How we use it:** Each beat in the `DialogueFlow` is assigned a severity. The `DialogueFlowQuery` is instructed to start at the previous session's tension level and escalate gradually — rising at most 1 severity point per beat. This encodes VAWG escalation structurally across the session arc, rather than relying on the model to spontaneously escalate.
+
+This means escalation is now a planned property of the data, not an emergent (and unreliable) byproduct of the model's generation.
+
+---
+
+### Technique 3: PSYDIAL Persona Consistency Filter
+
+**Source:** Han et al. (2024). "PSYDIAL: Personality-based Synthetic Dialogue Generation using Large Language Models." *Proceedings of LREC-COLING 2024*, pp. 13321–13331.
+
+**What PSYDIAL does:** After generating a candidate utterance, a separate LLM judge evaluates whether the message is consistent with the character's personality. If it fails, the generation is discarded and retried. This is a post-generation filter in the architecture — not a prompt change.
+
+**Our adaptation:** `PersonaConsistencyQuery` receives:
+- The character's personality description
+- The last 4 turns of conversation history
+- The candidate message
+
+It returns `is_consistent: bool` and `reason: str`. If `is_consistent` is False, the pipeline discards the candidate and regenerates. Up to 3 retries; on exhaustion, the last candidate is accepted rather than dropping the turn.
+
+The filter checks three dimensions (drawn from the PSYDIAL paper):
+- Tone and register consistency
+- Behavioural pattern consistency (e.g. brevity when impatient, dismissiveness)
+- Situational coherence given what just happened in the conversation
+
+**This is the key difference from a prompt constraint:** The constraint is in the generation loop — each turn's output must pass a programmatic check — not in the generation prompt itself. A prompt constraint relies on the model following it; an architectural filter enforces it regardless.
+
+**New file:** `src/synthetic_conversation_generation/llm_queries/persona_consistency_query.py`
+
+---
+
+### Pipeline.py changes summary
+
+- New import: `DialogueFlow`, `DialogueFlowQuery`, `PersonaConsistencyQuery`
+- `all_dialogue_flows: list[DialogueFlow] = []` — collects all session flows for output
+- Pre-loop: `DialogueFlowQuery` for session 1 runs before any messages generated
+- Per-turn: PSYDIAL filter wraps `CharacterMessageQuery` with retry loop (`_MAX_RETRIES = 3`)
+- Beat advancement every `_TURNS_PER_BEAT = 2` turns; when beats exhausted, `current_beat = None` so generator wraps up naturally
+- Per-session-end: new `DialogueFlowQuery` for the next session
+- Output JSON now includes `dialogue_flows` section
+
+---
+
+### Beat exhaustion bug — fix applied
+
+**Observed behaviour:** In run 6543856 (see Section 16), session 2 exhausted all 6 beats mid-conversation but the last beat remained active. The generator received the same beat topic for ~30 subsequent turns, producing a loop on "performance review template + Q3 metrics."
+
+**Root cause:** When `is_exhausted()` was True, `advance()` was never called and `current_beat` still pointed to the last beat. The generator had no signal that the planned material was done.
+
+**Fix:** When `is_exhausted()` is True, `current_beat` is set to `None` instead of the last beat. The generator then receives a prompt with no beat section and wraps up the session naturally.
+
+---
+
+## Section 16 — Run 6543856 (080726_2044): First Run with SynDG + PSYDIAL
+
+### Code active in this run
+
+- `DialogueFlowQuery` + `DialogueFlow` + `Beat` (SynDG, Bao et al. ACL 2023)
+- `PersonaConsistencyQuery` retry loop (PSYDIAL, Han et al. LREC-COLING 2024)
+- Beat severity tiers from STOP (Morabito et al. EMNLP 2024)
+- All fixes from Sections 10–11 still active
+- **Note:** Beat exhaustion bug was present in this run and fixed after.
+
+**Characters:** Sophie Walker (victim) + Ryan Chambers (perpetrator)  
+**Model:** gpt-oss:20b  
+**Final state:** tension 4/5, phase = post_incident, incident_occurred = True
+
+---
+
+### What improved
+
+**Tension reached level 4 — the highest result to date.**
+
+The state assessor correctly identified that a real relational event had occurred and reported tension 4/5, post_incident, incident_occurred=True. For the first time, the pipeline produced output with a meaningful abusive arc rather than hovering at 2 throughout.
+
+**Session 1 covered 6 distinct topics.**
+
+The dialogue flow for session 1 produced:
+1. API versioning (sev 1)
+2. Code review feedback (sev 2)
+3. Meeting scheduling (sev 2)
+4. Deployment pipeline (sev 3)
+5. Documentation (sev 3)
+6. Team lunch (sev 4)
+
+Every beat produced a distinct topical exchange. Topic lock within session 1 was completely resolved by the SynDG planning mechanism. The beats advanced on schedule and the conversation naturally moved forward.
+
+---
+
+### Failure 1: Context retention — Sophie ignores explicit instructions
+
+Sophie said "I'll stop pinging you about this" in direct response to Ryan telling her to stop, and then asked the same question again two turns later. Ryan's explicit instruction ("stop pinging me unless there's a blocker") was being obeyed in the turn it was given and ignored thereafter.
+
+**Root cause:** The rolling summary captured this as a personality trait — "Sophie consistently apologizes, double-checks... Ryan terse..." — not as a discrete active instruction. Once compressed, the specific instruction ("stop pinging") lost its force. Sophie's subsequent prompts contained no record of that specific directive having been issued, only a vague characterisation of the dynamic.
+
+This is the rolling summary's structural limitation: it represents relational state as prose, which is good for narrative continuity but bad for retaining discrete, actionable constraints.
+
+---
+
+### Failure 2: Session 2 beat exhaustion loop
+
+Session 2 exhausted its 6 planned beats mid-conversation and then looped for ~30 turns on the last beat ("performance review template + Q3 metrics"), because `current_beat` remained set to the last beat rather than being cleared.
+
+Fixed after this run (see Section 15 above).
+
+---
+
+### Summary
+
+| Aspect | Status |
+|---|---|
+| Topic lock | **Resolved** — SynDG produced 6 distinct topics in session 1 |
+| Tension accumulation | **Best result to date** — tension 4/5, post_incident |
+| VAWG arc | **Present** — incident_occurred=True, meaningful relational event detected |
+| Beat exhaustion | **Bug found** — ~30 turn loop in session 2; fixed after this run |
+| Context retention | **Failure diagnosed** — Sophie ignores explicit instructions after rolling summary compresses them |
+| PSYDIAL filter | **Active** — retry loop ran without errors |
+
+---
+
+## Section 17 — Commitment Cache: Application-Layer Context Retention
+
+### Motivation
+
+Run 6543856 diagnosed a specific failure: Sophie ignores explicit instructions from Ryan ("stop pinging me") because once those instructions are absorbed into the rolling summary they lose specificity. The rolling summary is designed to compress narrative — it describes *who these people are and what the pattern is*, not *what specific directive was issued at turn N and must still be respected at turn N+30*.
+
+This is the context retention problem. The rolling summary cannot solve it because compression is its purpose. What is needed is a separate structure that retains discrete, actionable instructions verbatim, regardless of how much time has passed.
+
+---
+
+### Technique: Application-Layer KV Cache
+
+**Inspired by:** Liu et al. (2025). "LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference." arXiv:2510.09665.
+
+**What LMCache does:** LMCache is an infrastructure system that stores GPU-side attention KV tensors out of GPU memory (to CPU, disk, or remote storage) so they can be reused across queries that share a common prefix, without recomputing them. It treats cached context as structured, addressable entries rather than opaque text blobs.
+
+**Why LMCache itself is not directly applicable:** LMCache requires deep hooks into inference engine internals (`start_load_kv`, `wait_load_kv`, `start_store_kv` — Table 2 of the paper). These are vLLM/SGLang-level calls. Our pipeline sends API requests to Ollama and does not have access to the attention computation layer.
+
+**What we adapt:** The *architectural insight* — treat cached context as structured, addressable key-value entries rather than compressing everything into a flat prose blob. Applied at the semantic layer rather than the GPU tensor layer:
+
+- **Key:** (recipient, topic)
+- **Value:** the commitment text, verbatim
+
+This is a semantic analogue of LMCache's prefix cache: just as LMCache persists KV tensors that are expensive to recompute, the commitment cache persists explicit instructions that are destructive to compress.
+
+---
+
+### Implementation
+
+**New files:**
+
+**`data_models/commitment_cache.py`**
+- `CommitmentEntry` dataclass: `speaker`, `recipient`, `text`, `turn_index`
+- `CommitmentCache` class: list of entries; methods `add()`, `get_for_recipient(recipient, current_turn)`, `evict_stale(current_turn)`
+- TTL = 40 turns: entries older than 40 turns are dropped
+
+**`llm_queries/commitment_extraction_query.py`**
+- Runs after every exchange (every 2 turns)
+- Scans the last 2 turns for explicit instructions or commitments
+- Returns `CommitmentExtractionResult` with a list of `CommitmentEntry` objects
+- Strict filter: vague emotional statements, tone, apologies are not commitments; only direct actionable instructions qualify
+- Invalid character names rejected in `parse_response`
+
+**`character_message_query.py` (modified)**
+- Accepts `commitment_cache: Optional[CommitmentCache] = None`
+- On prompt generation, calls `get_for_recipient(self.sender.name, current_turn)` for live commitments directed at the sender
+- If any exist, injects a clearly-labelled block before the closing instruction:
+  ```
+  Things you have been explicitly told to do or not do:
+  - Ryan told you: "stop sending follow-up messages about this"
+  You must respect these — do not act as if they were never said.
+  ```
+
+**`pipeline.py` (modified)**
+- `CommitmentCache` instantiated once at conversation start
+- After each exchange, `CommitmentExtractionQuery` runs; new entries added to cache; `evict_stale()` called
+- All new entries logged at INFO level: `Commitment cached: Ryan → Sophie: "..."`
+- Output JSON now includes `commitment_cache` field (list of all entries)
+- Return signature extended: `return conversation, state, rolling_summary, all_dialogue_flows, commitment_cache`
+
+---
+
+### Why this is distinct from the rolling summary
+
+| | Rolling Summary | Commitment Cache |
+|---|---|---|
+| Format | Prose (4 fields: events, details, open_threads, dynamic) | Structured list of discrete entries |
+| Retention | Compresses earlier turns into narrative | Retains instructions verbatim until TTL |
+| What it captures | Relational state, patterns, emotional arc | Specific directives that must be obeyed |
+| What it loses | Specific wording of particular instructions | General narrative context |
+| When it's active | Every turn (injected via summary block) | Only when commitments directed at the sender exist |
+
+The two structures are complementary: the rolling summary carries the story, the commitment cache carries the rules.
+
+---
+
+### Output changes
+
+The output JSON now includes a `commitment_cache` field:
+```json
+"commitment_cache": [
+  {
+    "speaker": "Ryan Chambers",
+    "recipient": "Sophie Walker",
+    "text": "stop sending follow-up messages unless there is a blocker",
+    "turn_index": 14
+  }
+]
+```
+
+This makes commitment extraction auditable in every run output.
+
+---
+
+## Section 18 — Research & Planning Phase: Taxonomy Grounding, Fine-Tuning, Evaluation Direction
+
+> No new generation runs since 6543856 (Section 16). This section records research findings and design decisions made while planning the next phase — the pipeline is considered stable enough to move toward corpus generation, fine-tuning, and formal evaluation.
+
+### Microaggression taxonomy source (Lagos Rojas et al., CHI 2026)
+
+Read "*Are Compliments Bad Now?*: Comparing LLMs and Human Interpretations of Gender Microaggressions in the Workplace" (Lagos Rojas, Genç, Bozzon, Colombo — CHI 2026). It is a detection/interpretation study, not a generation one, but yields two things directly useful to this project:
+
+1. **A validated 8-category workplace gender microaggression taxonomy** (built on Sue et al., Gartner, and Kim & Meister's STEM framework): undermining competence, sexual objectification, gender hostility, pathologizing character, gender as liability, restrictive gender roles, denial of experience/invalidation, exclusion. This is a concrete replacement for the current vague free-text `vawg_category` field.
+
+2. **A methodological warning for the evaluation phase** — see below.
+
+**Planned implementation (not yet coded):** wire the taxonomy in as a structured vocabulary flowing through the pipeline:
+- New `data_models/microaggression_taxonomy.py` — single source of truth (8 categories + definitions).
+- Add a `category` field to the `Beat` dataclass so each beat targets a named microaggression type as well as a STOP severity.
+- `DialogueFlowQuery` plans each non-neutral beat with a category (enum-constrained), spreading categories across the session arc — making escalation a planned traversal through a real taxonomy rather than free improvisation.
+- `StateAssessmentQuery` detects which categories are actually present (against the definitions) instead of a fuzzy category string.
+- Output JSON records category per beat. **Payoff: every generated conversation comes out pre-labelled with which microaggression category appears where — directly reusable as fine-tuning signal and as evaluation ground truth.** The gap between *intended* categories (plan) and *realised* categories (assessment) is itself an evaluation metric.
+
+### Evaluation warning — LLM judges ceiling-rate microaggressions
+
+The CHI paper's central empirical finding: on microaggression scenarios, LLM raters gave 4.7–5.0 with near-zero variance (many exactly 5.00 ± 0.00), while humans spread 3.04–4.73 with much wider variance. LLMs exhibit *categorical sensitivity* (rule-matching "this fits 'reinforcing stereotypes'") whereas humans with lived experience show *situated sensitivity* (context-grounded, ambiguity-aware).
+
+**Implication for our evaluation plan:** a naive LLM-as-judge (DeepEval / Elo / single Likert score) asked "does this contain a microaggression?" will over-detect and fail to discriminate between good and mediocre generations — it says "yes, 5/5" to almost everything. Mitigations to adopt when building the eval harness: include an explicit definition in the judge prompt (Kumar et al. — removing definitions sharply reduced recall); ask for contextual anchors and uncertainty; score against the 8-category taxonomy rather than binary yes/no; prefer pairwise (Elo) comparison over absolute scoring. This turns "I used an LLM judge" into "I designed the evaluation to avoid a documented failure mode of LLM judges in this exact domain" — a genuine dissertation strength.
+
+### Fine-tuning direction (DITTO grounding)
+
+Fine-tuning is being *considered* (not committed) and would be grounded in DITTO (Lu et al., ACL 2024, "LLMs are Superpositions of All Characters"): prompting a model to stay in character is fragile; fine-tuning on role-play dialogues bakes the persona into the weights so far less prompting is needed to hold character. This maps onto our persona-consistency and VAWG-signal problems. If pursued, **LoRA/QLoRA** is the likely technique — the practical, parameter-efficient way to do DITTO-style fine-tuning on a single AIRE GPU (cite Hu et al. 2022 for LoRA, DITTO for the motivation). Whether to fine-tune at all, and how, is pending supervisor input.
+
+Key decisions still open (raised with supervisor): (1) fine-tuning data — top quality-filtered synthetic subset vs. blending in real data to avoid circularity; (2) base model — likely drop from `gpt-oss:20b` to a 3–8B model with QLoRA to fit one GPU; (3) whether GPU-level KV caching is a required deliverable or the semantic commitment cache suffices.
+
+### Dataset survey for fine-tuning
+
+Surveyed external datasets. **Core caveat: almost all are detection datasets (single posts), not multi-turn dialogue — they cannot serve as direct dialogue fine-tuning data.** Their real use is content/phrasing seeds, taxonomy, and evaluation reference sets. The primary fine-tuning corpus remains our own generated-and-filtered conversations.
+
+| Dataset | Held / found | Real use | Not for |
+|---|---|---|---|
+| EXIST | Held | Sexism phrasings, taxonomy, eval reference | Direct dialogue FT (tweets) |
+| ToxiScope (Bhat et al. 2021; ~10k Avocado workplace emails) | Held (likely = "Microsoft Toxic Language Emails.pdf") | Workplace toxic register, deniable phrasing | Gender-specific / dialogue |
+| EDOS (SemEval-2023 Task 10; 20k Reddit/Gab) | Found | Best complementary taxonomy (4→11 subcategories) | Dialogue FT |
+| MentalManip (Wang et al., ACL 2024) | Found | Small *real multi-turn* anchor (gaslighting, guilt induction) — reduces circularity | Bulk data (modest size) |
+| GenderAlign | Found | — avoid: it is an *alignment/de-biasing* dataset, wrong direction; would worsen safety refusals | Generation FT |
+
+Recurring watch-out: most public datasets here are built for safety/moderation and push models toward refusal. For generation we want *content* and *taxonomy*, and must steer clear of alignment/detox data.
+
+### Status and possible directions
+
+This is not a committed plan — it is a set of directions under consideration while awaiting supervisor input on the open decisions above. Nothing below is scheduled; ordering and scope are still open.
+
+**Built and stable:**
+- SynDG dialogue flow (topic lock)
+- PSYDIAL persona filter
+- Commitment cache (context retention)
+
+**Directions being explored (order/priority TBD, pending supervisor):**
+- *Taxonomy grounding* — wiring the 8-category microaggression taxonomy into the pipeline (see above). Attractive to do before any large-scale generation so runs come out auto-labelled, but not yet decided.
+- *Corpus generation at scale* — running the pipeline to produce a dataset; doubles as fine-tuning material if that route is taken.
+- *Evaluation harness* (Elo / DeepEval) — would give a quality baseline; design must account for the LLM-judge ceiling-rating warning.
+- *Fine-tuning* (LoRA/QLoRA, DITTO-grounded) — dependent on corpus + a decision on data source and base model, both open questions for the supervisor.
+- *GPU-level KV caching* — only relevant if the project moves to direct model loading (which fine-tuning would require); may be background/inspiration rather than a deliverable — awaiting clarification.
+
+These interconnect (e.g. taxonomy grounding feeds corpus quality; evaluation brackets any fine-tuning) but the entry point depends on the supervisor's steer.
+
+---

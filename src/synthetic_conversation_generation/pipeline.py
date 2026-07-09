@@ -22,11 +22,15 @@ from anthropic import Anthropic
 from openai import OpenAI
 
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
+from synthetic_conversation_generation.data_models.commitment_cache import CommitmentCache
 from synthetic_conversation_generation.data_models.conversation import Conversation, ROLE
 from synthetic_conversation_generation.data_models.conversation_state import ConversationState
 from synthetic_conversation_generation.data_models.world import World
+from synthetic_conversation_generation.data_models.dialogue_flow import DialogueFlow
 from synthetic_conversation_generation.llm_queries.character_message_query import CharacterMessageQuery
+from synthetic_conversation_generation.llm_queries.commitment_extraction_query import CommitmentExtractionQuery
 from synthetic_conversation_generation.llm_queries.conversation_completion_query import ConversationCompletionQuery
+from synthetic_conversation_generation.llm_queries.dialogue_flow_query import DialogueFlowQuery
 from synthetic_conversation_generation.llm_queries.llm_query import (
     ModelProvider,
     OpenAIModelProvider,
@@ -34,6 +38,7 @@ from synthetic_conversation_generation.llm_queries.llm_query import (
     OllamaModelProvider,
     TransformersModelProvider,
 )
+from synthetic_conversation_generation.llm_queries.persona_consistency_query import PersonaConsistencyQuery
 from synthetic_conversation_generation.llm_queries.rolling_summary_query import RollingSummaryQuery, RollingSummary
 from synthetic_conversation_generation.llm_queries.state_assessment_query import StateAssessmentQuery
 from synthetic_conversation_generation.temporal import ConversationTimer
@@ -101,6 +106,35 @@ def run_pipeline(
     state = initial_state
     session_count = 0
     rolling_summary: RollingSummary | None = None
+    all_dialogue_flows: list[DialogueFlow] = []
+    # Application-layer commitment cache (LMCache-inspired, Liu et al., 2025):
+    # persists explicit instructions across summary compression boundaries.
+    commitment_cache = CommitmentCache()
+
+    # Beats advance every this many turns within a session (one full exchange = 2 turns).
+    _TURNS_PER_BEAT = 2
+
+    # Dialogue flow pre-planning (SynDG, Bao et al., ACL 2023):
+    # the session's topic arc is determined before any messages are generated.
+    # Beat severity tiers follow the STOP offensive progression scale
+    # (Morabito et al., EMNLP 2024): 1 = neutral → 5 = acute.
+    session_count_for_flow = 1
+    dialogue_flow: DialogueFlow = DialogueFlowQuery(
+        model_provider=model_provider,
+        model_id=model_id,
+        character_a=character_a,
+        character_b=character_b,
+        world=world,
+        session_number=session_count_for_flow,
+        previous_state=state,
+        rolling_summary=rolling_summary,
+    ).query()
+    all_dialogue_flows.append(dialogue_flow)
+    logger.info(
+        f"Session {session_count_for_flow} flow planned: "
+        + " | ".join(f"[{b.severity}] {b.topic}" for b in dialogue_flow.beats)
+    )
+    session_turn_count = 0
 
     for i in range(max_turns):
         is_sender_a = (i % 2 == 0)
@@ -109,32 +143,88 @@ def run_pipeline(
         role = ROLE.user if is_sender_a else ROLE.assistant
 
         next_ts, gap_minutes = timer.next_timestamp()
+        current_beat = dialogue_flow.current_beat
         logger.info(
             f"Turn {i} | session {session_count + 1}/{max_sessions} | {sender.name} | "
             f"phase={state.phase} | tension={state.tension_level}/5 | "
+            f"beat={dialogue_flow._current_index + 1}/{len(dialogue_flow.beats)} "
+            f"(sev={current_beat.severity}) | "
             f"gap={gap_minutes:.1f}min | {next_ts.strftime('%Y-%m-%d %H:%M')}"
         )
 
-        message = CharacterMessageQuery(
-            model_provider=model_provider,
-            model_id=model_id,
-            conversation=conversation,
-            sender=sender,
-            receiver=receiver,
-            world=world,
-            is_sender_character_a=is_sender_a,
-            next_timestamp=next_ts,
-            gap_minutes=gap_minutes,
-            state_summary=state.summary,
-            rolling_summary=rolling_summary,
-        ).query()
+        # Persona consistency filter (PSYDIAL, Han et al., LREC-COLING 2024):
+        # generate a candidate message and evaluate it against the character's
+        # personality; retry up to _MAX_RETRIES times on rejection.
+        _MAX_RETRIES = 3
+        accepted_message = None
+        for attempt in range(_MAX_RETRIES):
+            candidate = CharacterMessageQuery(
+                model_provider=model_provider,
+                model_id=model_id,
+                conversation=conversation,
+                sender=sender,
+                receiver=receiver,
+                world=world,
+                is_sender_character_a=is_sender_a,
+                next_timestamp=next_ts,
+                gap_minutes=gap_minutes,
+                state_summary=state.summary,
+                rolling_summary=rolling_summary,
+                current_beat=current_beat,
+                commitment_cache=commitment_cache,
+            ).query()
 
-        message.role = role
-        conversation.messages.append(message)
+            consistency = PersonaConsistencyQuery(
+                model_provider=model_provider,
+                model_id=model_id,
+                character=sender,
+                conversation=conversation,
+                candidate_message=candidate.content,
+                is_character_a=is_sender_a,
+                other_character_name=receiver.name,
+            ).query()
+
+            if consistency.is_consistent:
+                accepted_message = candidate
+                if attempt > 0:
+                    logger.info(
+                        f"Turn {i}: message accepted on attempt {attempt + 1} "
+                        f"({sender.name})"
+                    )
+                break
+            else:
+                logger.info(
+                    f"Turn {i}: persona filter rejected attempt {attempt + 1} "
+                    f"for {sender.name} — {consistency.reason}"
+                )
+
+        # If all retries failed, accept the last candidate rather than dropping the turn.
+        if accepted_message is None:
+            logger.warning(
+                f"Turn {i}: all {_MAX_RETRIES} attempts rejected for {sender.name}; "
+                f"accepting last candidate."
+            )
+            accepted_message = candidate
+
+        accepted_message.role = role
+        conversation.messages.append(accepted_message)
+        session_turn_count += 1
+
+        # Advance the beat every _TURNS_PER_BEAT turns within the session.
+        if session_turn_count % _TURNS_PER_BEAT == 0:
+            if not dialogue_flow.is_exhausted():
+                dialogue_flow.advance()
+                logger.info(
+                    f"Beat advanced → {dialogue_flow._current_index + 1}/{len(dialogue_flow.beats)}: "
+                    f"[sev={dialogue_flow.current_beat.severity}] {dialogue_flow.current_beat.topic}"
+                )
+            else:
+                # All planned beats realised — pass no beat so the generator
+                # wraps up naturally rather than re-entering the last topic.
+                current_beat = None
 
         # After each full exchange: update rolling summary, assess state, check session end
         if i % 2 == 1:
-            # Rolling summary: compress older turns every SUMMARY_INTERVAL turns
             total_turns = len(conversation.messages)
             if total_turns >= _SUMMARY_INTERVAL and total_turns % _SUMMARY_INTERVAL == 0:
                 summarise_up_to = total_turns - _RECENT_TURNS_KEPT
@@ -167,6 +257,24 @@ def run_pipeline(
 
             state = new_state
 
+            # Commitment cache population (LMCache-inspired, Liu et al., 2025):
+            # scan the last exchange for explicit instructions and persist them
+            # so they survive rolling summary compression.
+            extraction = CommitmentExtractionQuery(
+                model_provider=model_provider,
+                model_id=model_id,
+                conversation=conversation,
+                character_a=character_a,
+                character_b=character_b,
+                turn_index=len(conversation.messages),
+            ).query()
+            for entry in extraction.entries:
+                commitment_cache.add(entry)
+                logger.info(
+                    f"Commitment cached: {entry.speaker} → {entry.recipient}: \"{entry.text}\""
+                )
+            commitment_cache.evict_stale(len(conversation.messages))
+
             session_ended = ConversationCompletionQuery(
                 model_provider=model_provider,
                 model_id=model_id,
@@ -183,13 +291,29 @@ def run_pipeline(
                     logger.info(f"Reached max_sessions ({max_sessions}). Conversation complete.")
                     break
 
-                # Session boundary: jump forward by hours or days before the next session.
-                # The timer's Hawkes state is reset with a large forced gap so the next
-                # exchange starts fresh rather than continuing the previous burst.
                 timer.force_gap_hours(between=4, spread=20)
                 logger.info(f"Starting session {session_count + 1} — next message around {timer.current_time.strftime('%Y-%m-%d %H:%M')}")
 
-    return conversation, state, rolling_summary
+                # Plan the next session's beat sequence (SynDG: new flow per session).
+                session_count_for_flow += 1
+                session_turn_count = 0
+                dialogue_flow = DialogueFlowQuery(
+                    model_provider=model_provider,
+                    model_id=model_id,
+                    character_a=character_a,
+                    character_b=character_b,
+                    world=world,
+                    session_number=session_count_for_flow,
+                    previous_state=state,
+                    rolling_summary=rolling_summary,
+                ).query()
+                all_dialogue_flows.append(dialogue_flow)
+                logger.info(
+                    f"Session {session_count_for_flow} flow planned: "
+                    + " | ".join(f"[{b.severity}] {b.topic}" for b in dialogue_flow.beats)
+                )
+
+    return conversation, state, rolling_summary, all_dialogue_flows, commitment_cache
 
 
 if __name__ == "__main__":
@@ -230,7 +354,7 @@ if __name__ == "__main__":
 
     logger.info(f"Starting pipeline: {character_a.name} ↔ {character_b.name} | {world.title}")
 
-    conversation, final_state, rolling_summary = run_pipeline(
+    conversation, final_state, rolling_summary, all_dialogue_flows, commitment_cache = run_pipeline(
         model_provider=model_provider,
         model_id=args.model_id,
         character_a=character_a,
@@ -247,6 +371,17 @@ if __name__ == "__main__":
         "conversation_id": args.conversation_id,
         "world": world.title,
         "characters": [character_a.name, character_b.name],
+        "commitment_cache": commitment_cache.to_dict_list(),
+        "dialogue_flows": [
+            {
+                "session_number": flow.session_number,
+                "beats": [
+                    {"topic": b.topic, "severity": b.severity, "description": b.description}
+                    for b in flow.beats
+                ],
+            }
+            for flow in all_dialogue_flows
+        ],
         "rolling_summary": {
             "events": rolling_summary.events,
             "details": rolling_summary.details,
