@@ -2722,3 +2722,102 @@ generator renders *intensity* only intermittently. That intermittency is precise
 The architecture is delivering. The remaining gap is rendering, which is the fine-tuning objective.
 
 ---
+
+## Section 26 — Rolling Summarisation: Missing Theoretical Grounding and Future Work
+
+> **Status: recorded as future work, not scheduled.** The pipeline is delivering (§25.2), the
+> fine-tuning objectives are the critical path, and none of the items below fix a defect. The
+> **citation gap in §26.1 is the exception** — it costs no code and should be closed before the
+> write-up.
+
+### 26.1 — The finding: the project's own memory papers were never applied
+
+Rolling summarisation is the project's answer to long-term context retention, yet it is **the only
+major component with no theoretical grounding**. Every other mechanism traces to a paper:
+
+| Component | Grounded in |
+|---|---|
+| Timing | Hawkes (1971); Ogata (1988); Aoki (2016); Falkner (2022) |
+| Topic control | SynDG — Bao et al. (ACL 2023) |
+| Escalation | STOP — Morabito et al. (EMNLP 2024) |
+| Persona consistency | PSYDIAL — Han et al. (LREC-COLING 2024) |
+| Commitment cache | LMCache — Liu et al. (2025) |
+| Taxonomy | Capodilupo (2010); WoMenS (2025); Kim & Meister (2023) |
+| **Rolling summary** | **— nothing. Designed ad hoc.** |
+
+**Yet this project's own record names four long-term-memory papers as "key papers", and none are in
+the research folder, have been read, or are cited:**
+
+- **LoCoMo** — Maharana, A., Lee, D.-H., Tulyakov, S., Bansal, M., Barbieri, F., & Fang, Y. (2024).
+  Evaluating Very Long-Term Conversational Memory of LLM Agents. *ACL 2024*.
+- **LD-Agent** — Li, H., et al. (2024). Hello Again! LLM-powered Personalized Agent for Long-term
+  Dialogue. arXiv:2406.05925.
+- **MemoryBank** — Zhong, W., Guo, L., Gao, Q., Ye, H., & Wang, Y. (2024). MemoryBank: Enhancing
+  Large Language Models with Long-Term Memory. *AAAI 2024*.
+- **PersonaChat** — Zhang, S., Dinan, E., Urbanek, J., Szlam, A., Kiela, D., & Weston, J. (2018).
+  Personalizing Dialogue Agents: I have a dog, do you have pets too? *ACL 2018*.
+
+### 26.2 — The architecture already aligns with LD-Agent (arrived at independently)
+
+The rolling summary's four fields map onto LD-Agent's **event memory / persona memory** split, which
+was reached by iteration rather than by reading the paper:
+
+| RollingSummary field | LD-Agent equivalent |
+|---|---|
+| `events`, `details` | **event memory** |
+| `dynamic` | **persona memory** |
+| `open_threads` | (project-specific addition) |
+
+**MemoryBank** contributes an Ebbinghaus-style *forgetting curve* — memories decay unless reinforced.
+The commitment cache's `TTL = 40 turns` (§17) is a crude instance of exactly this.
+
+**LoCoMo** is the benchmark establishing that LLMs fail at long-range conversational coherence — i.e.
+this project's problem statement, currently uncited.
+
+**Action before the write-up (~2 hours, no code):** read LD-Agent and MemoryBank; reframe the rolling
+summary as an instantiation of the event/persona memory split, and the commitment cache TTL as a decay
+mechanism. This converts the project's only ungrounded component into a grounded one. Without it, "why
+this summary structure?" has no defensible answer beyond "it was designed by trial and error"; with it,
+the answer is a citation. Same code, materially stronger Background/Design chapters.
+
+### 26.3 — Three genuine capability gaps (deferred)
+
+Named for the write-up's future-work section. None is a defect; all are additions.
+
+1. **No retrieval.** The entire summary is injected into every generation turn regardless of relevance.
+   LD-Agent and MemoryBank *retrieve* memories per turn. Concretely: when a beat is about "team lunch",
+   the `details` field's rate-limiting middleware config and 120 ms latency figures are noise in the
+   prompt. Not currently harmful — the summary is ~2 kB — but it would not scale, and retrieval is the
+   more sophisticated technique.
+
+2. **No per-character memory** — *the most interesting unexplored idea in the project.* The summary is
+   written by an omniscient narrator and **both characters read the same paragraph**. Real participants
+   remember asymmetrically: Sophie remembers being dismissed; Ryan remembers being pestered. Per-character
+   memory would be more realistic, would differentiate the work from LD-Agent rather than merely matching
+   it, and connects to the §25.2 finding that Ryan has no post-incident register — he has no *memory* of
+   the incident from his own perspective. Cost: a second summarisation call per interval.
+
+3. **No decay or reinforcement.** `events` and `details` accumulate undifferentiated for the whole
+   conversation; only `open_threads` has a retirement rule (§10). MemoryBank's forgetting curve would
+   decay unreinforced details. In practice the LLM drops stale material implicitly during
+   re-summarisation, but this is unmanaged and unmeasured.
+
+### 26.4 — Decision on the assessor refactor: rejected
+
+A refactor was considered and **rejected**: feeding the rolling summary into `StateAssessmentQuery`
+(which currently reads the full conversation history) and dropping the redundant `dynamic` field, since
+it duplicates `ConversationState.summary`.
+
+**Reasons for rejection:**
+- The assessor's full-history read is **deliberate and load-bearing**. §14 added "tension accumulates
+  through patterns", which requires long-range context; §25.2's incident depended on the assessor
+  recognising an accumulated pattern. Substituting a lossy summary risks degrading exactly the
+  capability that produced the project's best result.
+- It is an optimisation, not a fix. The unbounded prompt is a scaling concern beyond ~300 turns; runs
+  are currently ~96 turns.
+- The `dynamic` / `state.summary` duplication costs tokens but breaks nothing.
+
+**Retained as a known inefficiency**, to be stated in the write-up rather than hidden: the relational
+read is computed twice per conversation by two different queries at two different frequencies.
+
+---
