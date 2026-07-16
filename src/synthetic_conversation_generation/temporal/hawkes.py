@@ -73,6 +73,34 @@ PHASE_PARAMETERS: dict[str, HawkesParameters] = {
 
 
 # ---------------------------------------------------------------------------
+# Session boundary gaps
+# ---------------------------------------------------------------------------
+
+# Gap ranges in HOURS, sampled uniformly, applied when one session ends and the
+# next begins.
+#
+# These are phase-dependent because the previous implementation used a fixed
+# 4-24h gap regardless of what had just happened, which was both unrealistic and
+# the main brake on the conversation's overall arc. The phases already model
+# withdrawal at the within-session level (post_incident has a ~17h baseline
+# precisely because someone has pulled back), yet a session ending immediately
+# after a relational incident resumed within a day like any other. After a real
+# incident, contact resumes in DAYS, not hours.
+#
+# Session boundaries are the dominant contributor to the conversation's total
+# span: measurement of run 6543856 found only 2 gaps exceeding 4h across 60
+# turns, and both were session boundaries. Making these phase-aware therefore
+# lengthens the arc and improves realism at the same time.
+SESSION_GAP_HOURS: dict[str, tuple[float, float]] = {
+    # (minimum hours, additional uniform spread)
+    "early_contact": (4, 20),    # later that day, or the next morning
+    "escalation":    (2, 10),    # contact resumes quickly while things are live
+    "post_incident": (16, 56),   # days of silence after a withdrawal (mean ~44h)
+    "re_initiation": (8, 32),    # tentative re-contact after a break (mean ~24h)
+}
+
+
+# ---------------------------------------------------------------------------
 # Core simulation — Ogata (1988) thinning algorithm
 # ---------------------------------------------------------------------------
 
@@ -211,24 +239,41 @@ class ConversationTimer:
         timestamp = self.start_time + timedelta(minutes=self._current_time_minutes)
         return timestamp, gap_minutes
 
-    def force_gap_hours(self, between: float = 4, spread: float = 20) -> None:
+    def force_gap_hours(
+        self,
+        between: Optional[float] = None,
+        spread: Optional[float] = None,
+    ) -> float:
         """
         Jump the clock forward by a random gap to simulate a session boundary.
 
-        Used when one conversation session has ended (e.g. "talk later") and
-        a new session is about to begin. The gap is sampled uniformly from
-        [between, between + spread] hours. The event history is cleared so the
-        next session's Hawkes excitation starts fresh rather than as a
-        continuation of the previous burst.
+        Used when one conversation session has ended and a new one is about to
+        begin. The gap is sampled uniformly from [between, between + spread]
+        hours. The event history is cleared so the next session's Hawkes
+        excitation starts fresh rather than continuing the previous burst — this
+        resets only the short-term burst dynamics, not the relationship's phase
+        or any narrative state.
+
+        If `between`/`spread` are not given, they are drawn from
+        SESSION_GAP_HOURS for the CURRENT PHASE, so that (for example) a session
+        ending in post_incident resumes days later rather than the same evening.
 
         Args:
-            between: Minimum gap in hours (default 4 — later that evening).
-            spread:  Additional random hours added on top (default 20 — up to ~a day later).
+            between: Minimum gap in hours. Defaults to the current phase's value.
+            spread:  Additional random hours on top. Defaults to the phase's value.
+
+        Returns:
+            The gap applied, in hours.
         """
+        if between is None or spread is None:
+            phase_between, phase_spread = SESSION_GAP_HOURS[self.phase]
+            between = phase_between if between is None else between
+            spread = phase_spread if spread is None else spread
+
         gap_hours = between + self._rng.uniform(0, spread)
-        gap_minutes = gap_hours * 60
-        self._current_time_minutes += gap_minutes
+        self._current_time_minutes += gap_hours * 60
         self._event_history = []  # fresh start for next session's excitation
+        return gap_hours
 
     @property
     def current_time(self) -> datetime:

@@ -21,3 +21,13 @@ class ConversationState:
     # between intended (Beat.category) and realised (this field) is itself an
     # evaluation signal: it measures whether the generator delivered the plan.
     detected_categories: list[str] = field(default_factory=list)
+
+    # Whether the conversation has reached a natural stopping point for now.
+    # Previously judged by a separate ConversationCompletionQuery, which cost ~30
+    # LLM calls per run and saw only the last 6 messages. Folded in here at zero
+    # marginal cost: the assessor already reads the whole conversation and knows
+    # the tension and phase, which is exactly the context that determines whether
+    # a conversation would naturally stop. Session ends stay emergent — they are
+    # not planned in advance, because a conversation's ending is a response to
+    # what happened in it.
+    session_ended: bool = False

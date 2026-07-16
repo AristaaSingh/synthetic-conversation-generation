@@ -132,14 +132,24 @@ class CharacterMessageQuery(LLMQuery):
         state_section = f"\nContext: {self.state_summary}\n" if self.state_summary else ""
 
         # Beat realisation step from SynDG (Bao et al., ACL 2023): the current
-        # beat from the pre-planned dialogue flow is injected as the topic/dynamic
-        # for this turn. The generator realises it in the character's own voice.
+        # beat from the pre-planned dialogue flow is injected as the topic for this
+        # turn. The generator realises it in the character's own voice.
+        #
+        # The beat is PERSPECTIVE-AWARE. `Beat.description` specifies the
+        # perpetrator's (character B's) behaviour, so only character B may see it.
+        # Previously it was shown to both characters, which handed the victim the
+        # perpetrator's script: in run 6641761 Sophie read "Ryan says 'Can you set
+        # up the catering?'" and agreed to it one turn BEFORE Ryan asked, because
+        # she was responding to his planned line rather than to anything he had
+        # actually said. The victim gets the topic; she must react to what is said
+        # to her, not to what the plan says will be said.
         if self.current_beat:
             beat_section = (
                 f"\nConversational beat for this turn:\n"
                 f"Topic: {self.current_beat.topic}\n"
-                f"Dynamic: {self.current_beat.description}\n"
             )
+            if not self.is_sender_character_a:
+                beat_section += f"Dynamic: {self.current_beat.description}\n"
         else:
             beat_section = ""
 

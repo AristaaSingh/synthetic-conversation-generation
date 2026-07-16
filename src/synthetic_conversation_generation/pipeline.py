@@ -4,9 +4,10 @@ pipeline.py — main entry point for synthetic VAWG conversation generation.
 Wires together:
   - CharacterCard + Scenario (inputs)
   - ConversationTimer (Hawkes process inter-message timing)
+  - DialogueFlowQuery (pre-plans each session's beats)
   - CharacterMessageQuery (generates each message)
-  - StateAssessmentQuery (assesses relational state after each exchange)
-  - ConversationCompletionQuery (decides when the conversation has ended)
+  - PersonaConsistencyQuery (rejects off-character messages)
+  - StateAssessmentQuery (relational state, and whether the session has ended)
 
 Phase transitions in the Hawkes process are event-driven: the StateAssessmentQuery
 determines which phase the conversation is in based on what has actually happened,
@@ -30,7 +31,6 @@ from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.data_models.dialogue_flow import DialogueFlow
 from synthetic_conversation_generation.llm_queries.character_message_query import CharacterMessageQuery
 from synthetic_conversation_generation.llm_queries.commitment_extraction_query import CommitmentExtractionQuery
-from synthetic_conversation_generation.llm_queries.conversation_completion_query import ConversationCompletionQuery
 from synthetic_conversation_generation.llm_queries.dialogue_flow_query import DialogueFlowQuery
 from synthetic_conversation_generation.llm_queries.llm_query import (
     ModelProvider,
@@ -90,11 +90,13 @@ def build_output(
         "dialogue_flows": [
             {
                 "session_number": flow.session_number,
+                "planned_turns": flow.total_turns(),
                 "beats": [
                     {
                         "topic": b.topic,
                         "category": b.category,
                         "severity": b.severity,
+                        "exchanges": b.exchanges,
                         "description": b.description,
                     }
                     for b in flow.beats
@@ -154,11 +156,12 @@ def run_pipeline(
     character_b: CharacterCard,
     world: World,
     conversation_id: str,
-    max_turns: int = 60,
-    max_sessions: int = 6,
+    target_days: float = 14.0,
+    max_turns: int = 300,
     conversation_start_time: datetime | None = None,
     hawkes_seed: int | None = None,
     output_path: Path | None = None,
+    exchange_budget: int = 5,
 ) -> Conversation:
     """
     Generate a single synthetic conversation spanning multiple sessions.
@@ -168,11 +171,33 @@ def run_pipeline(
       1. Update the narrative state summary (context for the next turn)
       2. Determine the current Hawkes phase (event-driven transition)
 
-    When the ConversationCompletionQuery detects a natural sign-off,
-    that is treated as a SESSION boundary rather than the end of the
-    conversation. A new session starts after a realistic gap (hours to
-    days). The conversation only ends when max_sessions is reached or
-    max_turns is exhausted.
+    A session ends when EITHER the assessor judges the conversation has reached a
+    natural stopping point (the primary, emergent trigger) OR the session's beat
+    plan is spent (a backstop). That is treated as a SESSION boundary rather than
+    the end of the conversation: the clock jumps forward hours-to-a-day and a fresh
+    beat plan is drawn up, informed by the tension and summary accumulated so far.
+    Sessions are unbounded — there is no session ceiling.
+
+    Termination
+    -----------
+    The conversation ends when the SIMULATED CLOCK passes `target_days`.
+
+    This replaces the previous `max_turns` / `max_sessions` ceilings, which were
+    proxies for a goal they only loosely tracked. The project's aim is an arc
+    spanning ~2 weeks, which is a statement about *duration*, not message count:
+    100 turns spanned 6d16h while the relationship stayed in escalation, but the
+    same 100 turns in post_incident (44h session gaps) would have spanned ~40 days.
+    Capping messages therefore cut conversations off at a number unrelated to the
+    goal, and forced every conversation to be the same length regardless of what
+    happened in it — itself a visible artefact in a corpus.
+
+    Terminating on duration makes turn count *emergent and variable*, which is the
+    realistic behaviour: a tense fortnight generates more messages than a withdrawn
+    one.
+
+    `max_turns` is retained only as a CIRCUIT BREAKER against a runaway run eating
+    the SLURM wall clock. It is set generously so that it does not bind in normal
+    operation; if it fires, that is a signal worth investigating, not a normal exit.
     """
     conversation = Conversation(
         id=conversation_id,
@@ -180,7 +205,12 @@ def run_pipeline(
         messages=[],
     )
 
-    start_time = conversation_start_time or datetime(2024, 1, 1, 9, 0)
+    # Fixed start time across all conversations — a deliberate simplification (see
+    # project_record.md 22.4). Monday 09:00 is chosen because the model *sees* this
+    # date on every history line, so it must be a plausible working morning:
+    # 1 January would be New Year's Day, and a weekend start would make the
+    # workplace content incoherent.
+    start_time = conversation_start_time or datetime(2026, 1, 5, 9, 0)
     initial_state = ConversationState(
         phase="early_contact",
         summary="The conversation has just started. No significant events have occurred yet.",
@@ -194,6 +224,10 @@ def run_pipeline(
         seed=hawkes_seed,
     )
 
+    # Per-session planning budget, in exchanges (1 exchange = 2 turns). Now a direct
+    # parameter rather than being derived from max_sessions: with sessions unbounded
+    # there is no session count to divide by, and the old derivation coupled two
+    # unrelated things (raising max_sessions silently shortened every session).
     state = initial_state
     session_count = 0
     rolling_summary: RollingSummary | None = None
@@ -202,8 +236,6 @@ def run_pipeline(
     # persists explicit instructions across summary compression boundaries.
     commitment_cache = CommitmentCache()
 
-    # Beats advance every this many turns within a session (one full exchange = 2 turns).
-    _TURNS_PER_BEAT = 2
 
     def checkpoint(complete: bool = False) -> None:
         """Persist current progress so a timeout or crash does not lose the run."""
@@ -239,14 +271,16 @@ def run_pipeline(
         session_number=session_count_for_flow,
         previous_state=state,
         rolling_summary=rolling_summary,
+        exchange_budget=exchange_budget,
     ).query()
     all_dialogue_flows.append(dialogue_flow)
     logger.info(
         f"Session {session_count_for_flow} flow planned: "
         + " | ".join(f"[{b.severity}/{b.category or 'none'}] {b.topic}" for b in dialogue_flow.beats)
     )
-    session_turn_count = 0
 
+    # `max_turns` is a circuit breaker, not the termination condition — the loop
+    # exits on simulated duration (checked after each exchange, below).
     for i in range(max_turns):
         is_sender_a = (i % 2 == 0)
         sender = character_a if is_sender_a else character_b
@@ -254,12 +288,18 @@ def run_pipeline(
         role = ROLE.user if is_sender_a else ROLE.assistant
 
         next_ts, gap_minutes = timer.next_timestamp()
+        # None once the plan is spent — the generator then winds down on its own
+        # rather than being handed the same final beat over and over.
         current_beat = dialogue_flow.current_beat
-        logger.info(
-            f"Turn {i} | session {session_count + 1}/{max_sessions} | {sender.name} | "
-            f"phase={state.phase} | tension={state.tension_level}/5 | "
+        beat_desc = (
             f"beat={dialogue_flow._current_index + 1}/{len(dialogue_flow.beats)} "
-            f"(sev={current_beat.severity}) | "
+            f"(sev={current_beat.severity}, cat={current_beat.category or 'none'})"
+            if current_beat else "beat=exhausted"
+        )
+        logger.info(
+            f"Turn {i} | session {session_count + 1} | day {timer.elapsed_days:.1f}/{target_days:g} | "
+            f"{sender.name} | "
+            f"phase={state.phase} | tension={state.tension_level}/5 | {beat_desc} | "
             f"gap={gap_minutes:.1f}min | {next_ts.strftime('%Y-%m-%d %H:%M')}"
         )
 
@@ -319,20 +359,22 @@ def run_pipeline(
 
         accepted_message.role = role
         conversation.messages.append(accepted_message)
-        session_turn_count += 1
 
-        # Advance the beat every _TURNS_PER_BEAT turns within the session.
-        if session_turn_count % _TURNS_PER_BEAT == 0:
-            if not dialogue_flow.is_exhausted():
-                dialogue_flow.advance()
+        # Spend one turn on the current beat. The flow advances itself once the beat
+        # has had the number of exchanges it asked for — beats are variable length,
+        # so this is no longer a fixed every-2-turns rule.
+        was_exhausted = dialogue_flow.is_exhausted()
+        dialogue_flow.record_turn()
+        if not was_exhausted:
+            nxt = dialogue_flow.current_beat
+            if nxt is None:
+                logger.info("Beat plan exhausted — generator will wind down unprompted")
+            elif nxt is not current_beat:
                 logger.info(
                     f"Beat advanced → {dialogue_flow._current_index + 1}/{len(dialogue_flow.beats)}: "
-                    f"[sev={dialogue_flow.current_beat.severity}] {dialogue_flow.current_beat.topic}"
+                    f"[sev={nxt.severity}, cat={nxt.category or 'none'}, "
+                    f"{nxt.exchanges}ex] {nxt.topic}"
                 )
-            else:
-                # All planned beats realised — pass no beat so the generator
-                # wraps up naturally rather than re-entering the last topic.
-                current_beat = None
 
         # After each full exchange: update rolling summary, assess state, check session end
         if i % 2 == 1:
@@ -391,28 +433,54 @@ def run_pipeline(
             # exchange rather than the entire run.
             checkpoint()
 
-            session_ended = ConversationCompletionQuery(
-                model_provider=model_provider,
-                model_id=model_id,
-                conversation=conversation,
-                character_a=character_a,
-                character_b=character_b,
-            ).query()
+            # Session end. Two independent triggers:
+            #   1. The assessor judged the conversation reached a natural stopping
+            #      point. This is the primary, emergent mechanism — an ending is a
+            #      response to what happened, so it cannot be planned in advance.
+            #      It replaces the separate ConversationCompletionQuery, which cost
+            #      ~30 LLM calls per run, saw only the last 6 messages, and rarely
+            #      fired. The assessor reads the whole conversation and already knows
+            #      the tension and phase, so it judges this at zero marginal cost.
+            #   2. The beat plan is spent. A backstop: without it the conversation
+            #      runs on unplanned to max_turns (previously 48 of 60 turns).
+            beats_spent = dialogue_flow.is_exhausted()
+            session_ended = state.session_ended or beats_spent
 
             if session_ended:
                 session_count += 1
-                logger.info(f"Session {session_count} ended at turn {i} ({next_ts.strftime('%Y-%m-%d %H:%M')})")
+                reason = "natural stopping point" if state.session_ended else "beat plan spent"
+                logger.info(
+                    f"Session {session_count} ended at turn {i} ({reason}) "
+                    f"({next_ts.strftime('%Y-%m-%d %H:%M')})"
+                )
 
-                if session_count >= max_sessions:
-                    logger.info(f"Reached max_sessions ({max_sessions}). Conversation complete.")
+                # Terminate on SIMULATED DURATION. Checked at a session boundary
+                # rather than mid-session so the conversation never stops halfway
+                # through an exchange. The gap that has just been applied is
+                # included, so a boundary that carries the clock past the target
+                # ends the run here.
+                if timer.elapsed_days >= target_days:
+                    logger.info(
+                        f"Reached target span ({timer.elapsed_days:.1f}/{target_days:g} days) "
+                        f"after {session_count} sessions, {len(conversation.messages)} turns. "
+                        f"Conversation complete."
+                    )
                     break
 
-                timer.force_gap_hours(between=4, spread=20)
-                logger.info(f"Starting session {session_count + 1} — next message around {timer.current_time.strftime('%Y-%m-%d %H:%M')}")
+                # Gap length now depends on the phase the session ended in: a
+                # session that ended in post_incident resumes days later, not the
+                # same evening. Session boundaries are the dominant contributor to
+                # the conversation's overall span (§22), so this is the main lever
+                # on arc length as well as a realism fix.
+                gap_h = timer.force_gap_hours()
+                logger.info(
+                    f"Starting session {session_count + 1} — {gap_h:.1f}h gap "
+                    f"(phase={state.phase}) — next message around "
+                    f"{timer.current_time.strftime('%Y-%m-%d %H:%M')}"
+                )
 
                 # Plan the next session's beat sequence (SynDG: new flow per session).
                 session_count_for_flow += 1
-                session_turn_count = 0
                 dialogue_flow = DialogueFlowQuery(
                     model_provider=model_provider,
                     model_id=model_id,
@@ -422,6 +490,7 @@ def run_pipeline(
                     session_number=session_count_for_flow,
                     previous_state=state,
                     rolling_summary=rolling_summary,
+                    exchange_budget=exchange_budget,
                 ).query()
                 all_dialogue_flows.append(dialogue_flow)
                 logger.info(
@@ -450,8 +519,14 @@ if __name__ == "__main__":
                         choices=["openai", "anthropic", "ollama", "transformers"],
                         default="ollama")
     parser.add_argument("--model-id", type=str, default="llama3:latest")
-    parser.add_argument("--max-turns", type=int, default=60)
-    parser.add_argument("--max-sessions", type=int, default=6)
+    parser.add_argument("--target-days", type=float, default=14.0,
+                        help="Simulated days to generate. This is the termination "
+                             "condition — the conversation ends when the clock passes it.")
+    parser.add_argument("--max-turns", type=int, default=300,
+                        help="Circuit breaker only. Set generously; if it fires, the run "
+                             "hit an unexpected condition rather than finishing normally.")
+    parser.add_argument("--exchange-budget", type=int, default=5,
+                        help="Exchanges the planner budgets per session (1 exchange = 2 turns).")
     parser.add_argument("--hawkes-seed", type=int, default=None)
     parser.add_argument("--conversation-id", type=str, default="001")
     args = parser.parse_args()
@@ -480,8 +555,9 @@ if __name__ == "__main__":
         character_b=character_b,
         world=world,
         conversation_id=args.conversation_id,
+        target_days=args.target_days,
         max_turns=args.max_turns,
-        max_sessions=args.max_sessions,
+        exchange_budget=args.exchange_budget,
         hawkes_seed=args.hawkes_seed,
         output_path=Path(args.output_path),
     )

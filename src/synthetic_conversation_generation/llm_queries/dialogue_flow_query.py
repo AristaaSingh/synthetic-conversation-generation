@@ -43,7 +43,9 @@ class DialogueFlowQuery(LLMQuery):
         session_number: int,
         previous_state: ConversationState,
         rolling_summary: RollingSummary | None = None,
-        beats_per_session: int = 6,
+        exchange_budget: int = 6,
+        min_beats: int = 3,
+        max_beats: int = 6,
     ):
         super().__init__(model_provider, model_id)
         self.character_a = character_a
@@ -52,7 +54,14 @@ class DialogueFlowQuery(LLMQuery):
         self.session_number = session_number
         self.previous_state = previous_state
         self.rolling_summary = rolling_summary
-        self.beats_per_session = beats_per_session
+        # The planner is given a BUDGET rather than a fixed beat count, and decides
+        # both how many beats to use and how long each one needs. Previously the
+        # count was hardcoded at 6 and every beat got exactly 2 turns, which was
+        # (a) arbitrary and (b) arithmetically incompatible with the turn budget:
+        # 6 beats x 2 turns x 6 sessions = 72 turns, against a max_turns of 60.
+        self.exchange_budget = exchange_budget
+        self.min_beats = min_beats
+        self.max_beats = max_beats
 
     def generate_prompt(self):
         if self.rolling_summary:
@@ -79,9 +88,9 @@ Setting: {self.world.setting.strip()}
 {self.character_a.name}'s role: {self.world.character_a_role.strip()}
 {self.character_b.name}'s role: {self.world.character_b_role.strip()}
 {prior_context}
-Produce exactly {self.beats_per_session} beats. Each beat is realised as approximately 2 text messages (one exchange). Together they form a coherent session arc.
+You have a budget of about {self.exchange_budget} exchanges for this session (one exchange = one message from each person). Produce between {self.min_beats} and {self.max_beats} beats whose exchange counts sum to roughly that budget. Together they form a coherent session arc.
 
-Each beat is defined on two independent axes: WHICH KIND of dynamic is in play (category), and HOW INTENSE it is (severity).
+Each beat is defined on three axes: WHICH KIND of dynamic is in play (category), HOW INTENSE it is (severity), and HOW MUCH ROOM it needs (exchanges).
 
 Microaggression categories available in this setting:
 {self.world.category_definitions()}
@@ -93,7 +102,14 @@ Severity tiers (STOP framework):
 4 = significant — something said or done that lands badly; dynamic now explicit
 5 = acute — confrontation, withdrawal, or a clear relational incident
 
+How much room a beat needs (exchanges):
+1 = a quick hand-off or logistical exchange — asked and answered, nothing more to say
+2 = a normal back-and-forth with a little friction
+3-4 = something lands badly and needs room to land, draw a reaction, and settle
+
 Rules:
+- Assign each beat the number of exchanges it genuinely needs. Do not give every beat the same number. Higher-severity beats generally need more room than trivial ones — a remark that stings cannot be delivered and resolved in one exchange.
+- The exchange counts across all beats should sum to roughly {self.exchange_budget}
 - Start at severity {self.previous_state.tension_level} or {max(1, self.previous_state.tension_level - 1)} (consistent with current tension)
 - Escalate gradually — each beat may stay the same or rise by at most 1 severity point
 - Each beat must name a concrete, real-world topic being discussed (e.g. "deployment pipeline error", "team meeting scheduling", "code review feedback")
@@ -108,8 +124,8 @@ Rules:
             "properties": {
                 "beats": {
                     "type": "array",
-                    "minItems": self.beats_per_session,
-                    "maxItems": self.beats_per_session,
+                    "minItems": self.min_beats,
+                    "maxItems": self.max_beats,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -129,12 +145,18 @@ Rules:
                                 "minimum": 1,
                                 "maximum": 5
                             },
+                            "exchanges": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4,
+                                "description": "How many back-and-forths this beat needs"
+                            },
                             "description": {
                                 "type": "string",
                                 "description": f"Specific behaviour {self.character_b.name} exhibits in this beat"
                             }
                         },
-                        "required": ["topic", "category", "severity", "description"],
+                        "required": ["topic", "category", "severity", "exchanges", "description"],
                         "additionalProperties": False
                     }
                 }
@@ -157,5 +179,8 @@ Rules:
                 severity=max(1, min(5, int(b["severity"]))),
                 description=b["description"],
                 category=category,
+                # Clamp: Ollama does not hard-enforce numeric bounds. A beat of 0
+                # exchanges would occupy no turns and be silently skipped.
+                exchanges=max(1, min(4, int(b.get("exchanges", 1)))),
             ))
         return DialogueFlow(session_number=self.session_number, beats=beats)

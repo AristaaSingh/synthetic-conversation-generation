@@ -172,13 +172,39 @@ class AnthropicModelProvider(ModelProvider):
 
 
 class OllamaModelProvider(ModelProvider):
+    """
+    Ollama-backed provider.
 
-    def __init__(self, client=None):
+    Note on reasoning models: gpt-oss and similar emit reasoning tokens *before*
+    the answer, and that reasoning is charged against the same `num_predict`
+    budget as the answer itself. If the budget runs out mid-reasoning, Ollama
+    truncates and the answer is never emitted at all -- the response comes back
+    with an EMPTY `content` field, which is indistinguishable from a total
+    failure unless the `thinking` field is inspected. See `_MAX_OUTPUT_TOKENS`.
+    """
+
+    # Maximum tokens the model may generate per call.
+    #
+    # Was 1024, which silently killed run 6641761 at turn 36: the dialogue-flow
+    # planner's prompt had grown to ~2,110 tokens (taxonomy definitions, three
+    # planning axes, an exchange budget), the model spent its entire 1024-token
+    # allowance reasoning about it, was cut off before emitting any JSON, and
+    # returned empty content. Three retries later the pipeline raised.
+    #
+    # 1024 was set when prompts were short and reasoning models were not in use.
+    # The L40S has 44 GiB and the served context is 32,768 tokens, so this cap was
+    # leaving almost the whole budget unused. 4096 gives reasoning models room to
+    # think *and* answer; unused tokens cost nothing, since generation stops at
+    # the closing brace.
+    _MAX_OUTPUT_TOKENS = 4096
+
+    def __init__(self, client=None, max_output_tokens: int | None = None):
         if client is None:
             if ollama is None:
                 raise ImportError("ollama package not installed. Install with `pip install ollama`." )
             client = ollama
         self.client = client
+        self.max_output_tokens = max_output_tokens or self._MAX_OUTPUT_TOKENS
 
     def query(self, user_msg: str, response_schema: Dict, model_id: str, timeout: int = 60):
         system_prompt = (
@@ -194,15 +220,49 @@ class OllamaModelProvider(ModelProvider):
                 {"role": "user", "content": user_msg},
             ],
             format="json",
-            options={"temperature": 0.6, "num_predict": 1024},
+            options={"temperature": 0.6, "num_predict": self.max_output_tokens},
             stream=False,
         )
 
-        content = response.get("message", {}).get("content", "")
+        message = response.get("message", {}) or {}
+        content = message.get("content", "") or ""
+
+        # Reasoning models return their chain of thought separately. If content is
+        # empty but thinking is not, the model was truncated mid-reasoning and
+        # never reached the answer -- surface that explicitly rather than
+        # reporting a bare "parse failed" with nothing to go on.
+        thinking = message.get("thinking", "") or ""
+
         try:
             return _parse_json_from_text(content)
         except Exception as exc:
-            raise ValueError(f"Ollama response parse failed; content was: {content}") from exc
+            raise ValueError(self._diagnose(content, thinking, response)) from exc
+
+    def _diagnose(self, content: str, thinking: str, response: Dict) -> str:
+        """Build an error message that identifies *why* the response was unusable."""
+        eval_count = response.get("eval_count")
+        parts = ["Ollama response parse failed."]
+
+        if not content and thinking:
+            parts.append(
+                f"Content was EMPTY but the model produced {len(thinking)} chars of "
+                f"reasoning — it was truncated mid-thought and never emitted an answer. "
+                f"num_predict={self.max_output_tokens} is likely too low for this prompt."
+            )
+        elif not content:
+            parts.append("Content was EMPTY and no reasoning was returned.")
+        else:
+            parts.append(f"Content ({len(content)} chars): {content[:400]}")
+
+        if eval_count is not None:
+            hit_cap = eval_count >= self.max_output_tokens
+            parts.append(
+                f"Generated {eval_count} tokens (cap {self.max_output_tokens})"
+                + (" — HIT THE CAP, so the output is truncated." if hit_cap else ".")
+            )
+        if thinking:
+            parts.append(f"Reasoning tail: ...{thinking[-200:]}")
+        return " ".join(parts)
 
     def response_format(self, response_schema: Dict) -> Dict:
         return response_schema

@@ -91,6 +91,8 @@ Assess the current state of the relationship. Determine:
 4. **incident_occurred** — true if a significant relational event has happened (an explicit confrontation, a moment of clarity for either character, a withdrawal, something that marks a before/after). False if the conversation is still in ordinary flow.
 
 5. **detected_categories** — which of the microaggression categories listed above are actually present in the conversation so far, based on what has been said. Use the exact category keys. Return an empty list if none are genuinely present — do not list a category just because it was expected.
+
+6. **session_ended** — whether this exchange has reached a natural stopping point for now. True if the last message is a sign-off (goodbye, "talk later", "see you tomorrow"), or if one person has withdrawn or gone quiet and there is nothing further to say right now. False if the conversation is mid-flow. People pick things up again later, so ending a session does not require the underlying situation to be resolved.
 """
 
     def response_schema(self):
@@ -121,9 +123,13 @@ Assess the current state of the relationship. Determine:
                         "enum": list(self.world.vawg_categories),
                     },
                     "description": "Microaggression categories actually present in the conversation so far"
+                },
+                "session_ended": {
+                    "type": "boolean",
+                    "description": "True if this exchange reached a natural stopping point for now"
                 }
             },
-            "required": ["phase", "summary", "tension_level", "incident_occurred", "detected_categories"],
+            "required": ["phase", "summary", "tension_level", "incident_occurred", "detected_categories", "session_ended"],
             "additionalProperties": False
         }
 
@@ -144,4 +150,5 @@ Assess the current state of the relationship. Determine:
             tension_level=max(1, min(5, int(json_response.get("tension_level", self.previous_state.tension_level)))),
             incident_occurred=json_response.get("incident_occurred", self.previous_state.incident_occurred),
             detected_categories=detected,
+            session_ended=bool(json_response.get("session_ended", False)),
         )

@@ -1267,13 +1267,28 @@ The filter checks three dimensions (drawn from the PSYDIAL paper):
 
 ---
 
-### Beat exhaustion bug — fix applied
+### Beat exhaustion bug — attempted fix (⚠️ THIS FIX DID NOT WORK — see §23.4)
+
+> **⚠️ CORRECTION (2026-07-15).** The fix described below was recorded as applied and effective. It was
+> **not**. It never took effect, and the bug remained silently active in **every subsequent run**. The
+> assignment `current_beat = None` was placed at the *bottom* of the turn loop — after that turn's message
+> had already been generated — and was overwritten at the *top* of the next iteration by
+> `current_beat = dialogue_flow.current_beat`. Compounding this, `DialogueFlow.current_beat` clamped with
+> `min(index, len-1)` and therefore returned the last beat forever once exhausted. Measured impact:
+> **48 of 60 turns (80%) of every default run were generated against the same exhausted beat.**
+> Properly diagnosed and fixed in **§23.4**. This subsection is retained as a record of the error.
 
 **Observed behaviour:** In run 6543856 (see Section 16), session 2 exhausted all 6 beats mid-conversation but the last beat remained active. The generator received the same beat topic for ~30 subsequent turns, producing a loop on "performance review template + Q3 metrics."
 
-**Root cause:** When `is_exhausted()` was True, `advance()` was never called and `current_beat` still pointed to the last beat. The generator had no signal that the planned material was done.
+**Root cause (as understood at the time — the diagnosis was right, the fix was not):** When `is_exhausted()` was True, `advance()` was never called and `current_beat` still pointed to the last beat. The generator had no signal that the planned material was done.
 
-**Fix:** When `is_exhausted()` is True, `current_beat` is set to `None` instead of the last beat. The generator then receives a prompt with no beat section and wraps up the session naturally.
+**Attempted fix:** When `is_exhausted()` is True, `current_beat` was set to `None` instead of the last beat, the intention being that the generator would receive a prompt with no beat section and wrap up naturally. **This did not happen** — see the correction above.
+
+**The deeper problem, unrecognised at the time (see §23.6):** the beat arithmetic was never coherent.
+6 beats × 2 turns = 12 turns of planned material against `max_turns=60`, so 48 turns had no plan
+regardless. The design assumed sessions would end when beats ran out, but session ends depended on
+`ConversationCompletionQuery`, which rarely fired (§9/§12/§14). The exhaustion handling was therefore
+load-bearing for 80% of every conversation, and it was broken.
 
 ---
 
@@ -1327,7 +1342,11 @@ This is the rolling summary's structural limitation: it represents relational st
 
 Session 2 exhausted its 6 planned beats mid-conversation and then looped for ~30 turns on the last beat ("performance review template + Q3 metrics"), because `current_beat` remained set to the last beat rather than being cleared.
 
-Fixed after this run (see Section 15 above).
+> **⚠️ CORRECTION (2026-07-15).** This was originally recorded as "fixed after this run (see Section 15)".
+> **It was not fixed.** The attempted fix never took effect and the loop persisted in every subsequent run
+> — 80% of a default 60-turn run was generated against a single exhausted beat. Genuinely fixed in
+> **§23.4**. Note also that session 1 was affected too, not just session 2: 6 beats × 2 turns = 12 turns of
+> plan against a 60-turn budget, so *every* session ran out of plan (§23.6).
 
 ---
 
@@ -1338,7 +1357,7 @@ Fixed after this run (see Section 15 above).
 | Topic lock | **Resolved** — SynDG produced 6 distinct topics in session 1 |
 | Tension accumulation | **Best result to date** — tension 4/5, post_incident |
 | VAWG arc | **Present** — incident_occurred=True, meaningful relational event detected |
-| Beat exhaustion | **Bug found** — ~30 turn loop in session 2; fixed after this run |
+| Beat exhaustion | **Bug found** — ~30 turn loop in session 2. *Recorded as fixed; it was not — see the correction above and §23.4* |
 | Context retention | **Failure diagnosed** — Sophie ignores explicit instructions after rolling summary compresses them |
 | PSYDIAL filter | **Active** — retry loop ran without errors |
 
@@ -2032,5 +2051,674 @@ rather than presenting the final scheme as if it had been obvious from the start
 **Known gap to address next:** `denial_of_reality_of_sexism` (n=42) is thin, and no workplace register
 is present in Biasly. CMSB, SWS and Guest et al. are the candidates to fill both gaps and should be
 pulled through the same preprocessing before the classifier is trained.
+
+---
+
+## Section 22 — Temporal Findings: The Arc-Length Problem and a Planned Hawkes Parameter Study
+
+> **Status: parked for later experimentation.** Recorded now while the evidence is fresh. The intended
+> sequence is fine-tuning first, then this parameter study — it is a self-contained, comparable
+> experiment that suits a dedicated results section.
+
+### 22.1 — Two clocks, not one
+
+A distinction worth stating explicitly in the write-up, because they are unrelated and easily conflated:
+
+| | **Wall-clock time** | **Simulated time** |
+|---|---|---|
+| What it is | Real time the SLURM job runs on AIRE | The fictional timeline inside the conversation |
+| Controlled by | `#SBATCH --time=01:00:00` | The Hawkes process + session gaps |
+| Consumed by | LLM inference (~220–460 calls per 60-turn run) | `timer.next_timestamp()` and `force_gap_hours()` |
+| Constraint | 1 hour, shared with container start, `sleep 15`, and a ~13 GB `ollama pull` | None — it is generated |
+
+Estimated inference cost: ~2–5 s/call → a 60-turn run is roughly **10–25 min** of pipeline time, which
+fits the hour comfortably. **~200 turns (≈1,000–1,500 calls ≈ 35–125 min) would exceed it**, likely
+mid-run — which is what motivated the incremental checkpointing added in §21/pipeline (`complete` flag +
+atomic writes). A timeout now costs one exchange rather than the whole run.
+
+### 22.2 — The finding: the 14-day arc is not happening, and turn count will not fix it
+
+Measured from run **6543856** (60 messages, the best run to date):
+
+| Metric | Value |
+|---|---|
+| First → last message | 2024-01-01 09:53 → 2024-01-02 21:37 |
+| **Simulated span** | **1 day, 11 hours** *(project goal: ~14 days)* |
+| **Median inter-message gap** | **1.0 minute** |
+| Min gap | 0.0 min |
+| Max gap | 13.5 hours |
+| Gaps > 4h (session-boundary-sized) | **2** across the entire run |
+
+**Diagnosis.** The median gap of 1 minute means the Hawkes process spends almost the whole conversation
+*inside self-excited bursts* and essentially never decays back to its baseline. For `early_contact`
+(μ=0.005, α=0.30, β=0.50) the baseline gap is ~200 minutes, but the branching ratio α/β = 0.60 means each
+message sustains the burst, and because turns are generated back-to-back the process is never given the
+chance to cool.
+
+**The important consequence:** *increasing `--max-turns` will produce a longer conversation but not a
+longer arc.* 200 turns at a 1-minute median is one very long afternoon, not two weeks. **Arc length is
+controlled by the Hawkes parameters and the session-boundary machinery, not by turn count.** These are
+independent levers and should not be conflated.
+
+This is not a defect in the thinning implementation (validated separately — CV > 1 for bursty phases,
+correct phase ordering). It is a **parameterisation** issue.
+
+### 22.3 — Planned experiment: Hawkes parameter study
+
+A self-contained study producing directly comparable results — well suited to a dissertation results
+section, and cheap to run because **the temporal layer needs no LLM at all** (`simulate_hawkes()` and
+`ConversationTimer` are pure maths; `validate_hawkes.py` already exercises them offline). Parameter
+sweeps can therefore be evaluated *without* burning GPU time, and only the promising configurations need
+a full generation run.
+
+**Hypotheses to test:**
+
+1. **Lower α/β widens gaps.** Reducing the branching ratio should let bursts die out sooner and return the
+   process to baseline, producing the long silences the arc needs.
+2. **Lower μ lengthens the baseline.** `early_contact` μ=0.005 → ~200 min baseline; halving μ doubles it.
+3. **Session boundaries are the dominant lever.** Only 2 gaps exceeded 4h, and both were
+   `force_gap_hours()` jumps — i.e. **the multi-day structure is coming almost entirely from session
+   boundaries, not from the Hawkes process.** Since `ConversationCompletionQuery` rarely fires (a
+   long-standing issue, §9/§12/§14), few boundaries occur and the arc stays short. Fixing sign-off
+   detection may matter more for arc length than any Hawkes retuning.
+
+**Proposed conditions** (measure simulated span, median gap, gap distribution, and CV for each):
+
+| Condition | Change | Expected effect |
+|---|---|---|
+| Baseline | current parameters | ~1.5 days, median 1 min |
+| Lower branching | α/β from 0.60 → ~0.30 in all phases | Shorter bursts, longer silences |
+| Lower baseline rate | μ halved per phase | Longer background gaps |
+| More sessions | force a boundary every N turns instead of relying on sign-off detection | Directly multiplies the arc |
+| Combined | best of the above | Target ~14 days |
+
+**Reportable output:** a table of (condition → simulated span, median gap, CV, messages/day profile),
+plus the existing burstiness plots regenerated per condition. This gives a genuine, quantified
+parameter-sensitivity analysis rather than a single hand-tuned configuration — and directly addresses
+the project's stated 14-day-arc goal, which is currently unmet.
+
+### 22.4 — Start time: a deliberate simplification (decision, 2026-07-15)
+
+`conversation_start_time` is a `run_pipeline` parameter with no CLI flag, so every conversation begins
+at the same hardcoded instant:
+
+```python
+start_time = conversation_start_time or datetime(2026, 1, 5, 9, 0)
+```
+
+**Decision: keep the start time constant across all conversations.** Varying it per run was considered
+and rejected as unnecessary complexity for the current objectives. The reasoning is sound for the chosen
+route:
+
+- **Objective B (injector)** trains on single-utterance parallel pairs — timestamps are not present in
+  its training data at all.
+- **Objective C (evaluator)** classifies text — it never sees timestamps.
+
+So the fixed start time is invisible to both models being trained, and is a defensible simplification
+rather than a shortcut. It should be **stated explicitly in the write-up** as a simplifying assumption.
+
+**The date itself is not arbitrary, and this matters.** The model *does* see the full date on every
+history line (`[2026-01-05 09:53] Sophie: ...`) and in the temporal context string, so the date must be a
+plausible working morning:
+
+- **2026-01-01 was rejected** — New Year's Day. A public holiday; deployment-pipeline discussions at 9am
+  on New Year's Day are implausible, and the model could visibly react to the date.
+- **2026-01-05 (a Monday) was chosen** — a normal start to a working week.
+
+**When this decision would need revisiting:** if the deferred **Objective A / dialogue-SFT route** is ever
+taken. That route trains on `(conversation context → next turn)` pairs, and the context *includes*
+timestamps — so every training example would show the same date, and identical day-of-week structure,
+across the entire corpus. At that point a `--start-time` CLI flag (or per-run randomisation) becomes a
+genuine requirement rather than a nicety. It is a small change; the note is here so the dependency is not
+forgotten.
+
+---
+
+## Section 23 — Code Assessment and Fixes (pre-fine-tuning)
+
+> A deliberate pass over the existing pipeline before committing to fine-tuning, on the principle that
+> generating a corpus from a defective generator wastes the corpus. Several of these were latent defects
+> silently degrading every run to date. Each subsection is self-contained.
+
+### 23.1 — Taxonomy grounding: replacing the free-text VAWG label
+
+**Problem.** The pipeline's only VAWG signal was `World.vawg_category`, a free-text string set to
+`"STEREOTYPING-DOMINANCE, IDEOLOGICAL-INEQUALITY"`. Tracing its origin: these are **EXIST Subtask-3
+labels** (confirmed in `exist2025_format_val_V0.2.py` — the full set is `["NO", "IDEOLOGICAL-INEQUALITY",
+"STEREOTYPING-DOMINANCE", "MISOGYNY-NON-SEXUAL-VIOLENCE", "SEXUAL-VIOLENCE", "OBJECTIFICATION"]`). So the
+labels were *sourced*, but wrong for the project on three counts:
+
+1. **A sixth competing taxonomy.** EXIST-5 (tweets) alongside Capodilupo-6 (canonical), Biasly-12, CHI-8,
+   SELFMA-4, WoMenS-8. The generator and the evaluator would have spoken different vocabularies and been
+   incomparable.
+2. **A bare label with no definition.** The model saw the string `"STEREOTYPING-DOMINANCE"` and had to
+   guess. This is precisely the configuration Kumar et al. (cited in Lagos Rojas et al., CHI 2026) show
+   sharply reduces detection sensitivity.
+3. **Tweet-oriented, not dyad-oriented.** EXIST categorises social-media posts, not colleague conversations.
+
+**Fix.**
+- `World.vawg_category: str` → `vawg_categories: list[str]`, **validated at load time** against
+  `microaggression_taxonomy`. An unknown key or an empty list now raises immediately rather than silently
+  feeding a meaningless string into a prompt.
+- New `data_models/microaggression_taxonomy.py` — the **single source of truth**, previously hardcoded
+  inside `evaluator/prepare_biasly.py`. Each of the 6 categories carries a `definition` (the general
+  Capodilupo sense) *and* a `workplace_form` (Kim & Meister's concrete manifestation). A load-time guard
+  fails loudly if the Biasly crosswalk ever drifts from the canonical keys — without it, a rename would
+  silently produce empty label columns and only surface later as odd metrics.
+- **Definitions now travel with the labels** into both the planner and the assessor prompts.
+- The world's palette is set to match how the perpetrator is actually written: `assumptions_of_inferiority`,
+  `second_class_citizenship`, `traditional_gender_roles`, `denial_of_reality_of_sexism`.
+  `sexual_objectification` and `use_of_sexist_language` are deliberately **out of scope** — Ryan is written
+  as someone who over-explains and re-attributes, not someone who comments on appearance or uses slurs.
+
+**Consequence.** Every conversation generated from here on is **auto-labelled in the same vocabulary the
+evaluator will speak.**
+
+### 23.2 — Beats gain a category axis
+
+`Beat` previously carried only `severity` — *how intense*. The *kind* of microaggression was left to the
+planner improvising inside free-text `description`. `Beat.category` makes that axis explicit and
+machine-checkable (enum-constrained in the schema, defensively validated in the parser because Ollama does
+not hard-enforce enums the way the OpenAI/Anthropic providers do).
+
+`ConversationState` gains **`detected_categories`** — which categories the assessor judges to be *actually
+present*, as opposed to those the planner *intended*. **The gap between intended and realised is itself an
+evaluation metric**, recorded in every run at zero extra cost.
+
+### 23.3 — Incremental checkpointing
+
+**Problem.** Output JSON was written once, at the very end. A SLURM timeout destroyed the entire run.
+
+**Fix.** `build_output()` extracted so checkpoints and the final write share one code path (a checkpoint
+file is shape-identical to a finished one). `run_pipeline` checkpoints after **every exchange**.
+
+**Crucially, `write_output()` is atomic** — temp file + `os.fsync` + `os.replace()`. A naive
+`open(w)`/`json.dump` would have been *worse than nothing*: a kill mid-write leaves a truncated file **and
+destroys the good checkpoint it was overwriting**. `os.replace` is atomic on POSIX, so the destination
+always holds either the previous complete checkpoint or the new one.
+
+Two new output fields: **`complete: bool`** (a checkpoint is otherwise indistinguishable from a finished
+run — **consumers must check this before admitting a conversation to the corpus**) and `turns_generated`.
+
+*Verified:* killed after 20 LLM calls → file survived, valid JSON, 4 messages, `complete: false`, no stray
+`.tmp`. Full run → `complete: true`.
+
+### 23.4 — The beat exhaustion bug: the §15 fix never worked
+
+**This is the significant find of the assessment.** §15/§16 recorded the beat-exhaustion loop as fixed. It
+was not, and it has been silently active in **every run since**.
+
+**The defect.** `current_beat` was assigned at the **top** of the turn loop from
+`dialogue_flow.current_beat`, but the compensating `current_beat = None` sat at the **bottom** — *after* the
+message for that turn had already been generated, and overwritten on the next iteration. Compounding it,
+`DialogueFlow.current_beat` clamped with `min(index, len-1)`, so it returned the **last beat forever** once
+exhausted.
+
+**Empirically confirmed** by instrumenting `CharacterMessageQuery` with a fake provider (no LLM, no GPU):
+
+```
+turn  0-11: topic 0 ... topic 5     (fresh beats)
+turn 12-29: topic 5, topic 5, ...   (the same beat, every remaining turn)
+```
+
+In a default 60-turn run, **48 of 60 turns (80%) ran on the same exhausted beat.** This is exactly the
+failure diagnosed in run 6543856 ("session 2 looped ~30 turns on performance review template + Q3 metrics")
+and wrongly recorded as resolved.
+
+**Root cause of the arithmetic.** 6 beats × 2 turns = 12 turns of planned material against `max_turns=60`.
+The design *assumed* sessions would end around when beats ran out — but session ends depended on
+`ConversationCompletionQuery`, which rarely fired (§9/§12/§14). So 80% of every conversation ran unplanned.
+
+**Fix.** Exhaustion is now owned by `DialogueFlow` itself and cannot be bypassed: `current_beat` returns
+**`None`** past the end, so the generator genuinely receives no beat and winds down.
+
+### 23.5 — Variable-length beats
+
+**Problem.** `_TURNS_PER_BEAT = 2` gave a trivial logistical exchange exactly as much room as a relational
+incident — actively working *against* the severity arc, since the severity-4 beats that matter got the same
+two messages as "what time's standup".
+
+**Fix.** `Beat.exchanges` (1–4), assigned by the planner. Beat duration is now a **planned property**:
+
+> 1 = a quick hand-off — asked and answered
+> 2 = a normal back-and-forth with a little friction
+> 3–4 = something lands badly and needs room to land, draw a reaction, and settle
+
+`DialogueFlow.record_turn()` advances when a beat has had the exchanges it asked for, replacing the fixed
+modulo. *Verified:* a 1-exchange beat received 2 turns; a 3-exchange severity-3 beat received 6.
+
+### 23.6 — The beat count is no longer a fixed number
+
+**Answering "why 6 beats?" — it was arbitrary, and the numbers were never internally consistent:**
+
+```
+6 beats × 2 turns   = 12 turns/session
+6 sessions × 12     = 72 turns needed
+max_turns           = 60          ← max_sessions=6 was mathematically unreachable
+```
+
+**Fix.** The planner is given an **exchange budget** and decides *both* the beat count (3–6) and each
+beat's length. The budget is derived from the turn budget — `(max_turns / max_sessions) / 2` — so the
+configuration is coherent by construction. Exposed as `--exchange-budget` for the planned Hawkes/arc
+experiments (§22).
+
+*Verified:* default run now produces **6 sessions in exactly 60 turns** (10 planned turns each) — which the
+previous configuration could never have achieved.
+
+### 23.7 — ConversationCompletionQuery deleted; session-end folded into the assessor
+
+**Problem.** A separate LLM call every exchange (**~30 calls/run, 7–13% of the entire LLM budget**) that saw
+only the last 6 messages and, per §9/§12/§14, rarely fired despite two rounds of fixes.
+
+**The deeper objection.** It was the **odd one out in the architecture**: topic, escalation, category and
+timing are all *planned or modelled*; session-end alone was *generated then detected by asking an LLM
+"did they say bye?"*. That is a detection solution to a planning problem — the exact prompt-and-hope pattern
+the project argues against.
+
+**Design decision.** A *planned* wind-down beat was considered and **rejected**: a conversation's ending is a
+*response* to what happened in it, so scripting it in advance forces an ending the content has not earned.
+Endings must stay emergent.
+
+**Fix.** `session_ended` is now a field on `StateAssessmentQuery` — which already runs every exchange, reads
+the **whole** conversation, and knows the tension and phase (i.e. strictly *more* context than the deleted
+detector ever had). **Zero marginal cost.** There is also a coherence argument: phase and session-end are the
+same judgement — if the assessor declares `post_incident` because someone withdrew, that withdrawal *is* the
+session ending.
+
+Sessions now end when **either** the assessor judges a natural stopping point (primary, emergent) **or** the
+beat plan is spent (backstop against the 48-turn dead zone). `conversation_completion_query.py` deleted.
+
+**Known risk, to monitor:** the assessor now returns six outputs (phase, summary, tension, incident,
+categories, session_ended). Task interference is a real possibility. If `session_ended` fires wildly or
+tension scores get noisier, split it back out.
+
+**Anticipated side effect on §22 (the arc problem).** §22 found only **2 gaps > 4h** in a 60-turn run, and
+*both were session boundaries* — i.e. the multi-day arc is driven almost entirely by `force_gap_hours()`,
+which fires only on session end. Reliable session ends should therefore **lengthen the arc without touching a
+single Hawkes parameter.** Measure this before the planned parameter study; it may resolve much of the arc
+problem on its own.
+
+### 23.8 — Phase-aware session gaps, and why the Hawkes parameters were left alone
+
+**The question.** §22 found the simulated arc was only 1 day 11h against a ~14-day goal, with a median gap
+of 1.0 min. The obvious move was to retune the Hawkes parameters to raise the median. **A parameter sweep
+showed this would have been the wrong fix.**
+
+**Measurement** (60 turns in `early_contact`, Hawkes only, no session gaps, averaged over 3 seeds — no LLM
+required, the temporal layer is pure maths):
+
+| Lever | Setting | Median gap | Span |
+|---|---|---|---|
+| **α** (excitation) | 0.30 → 0.05 | 5.9m → **134.4m** | 12.8d → 24.1d |
+| **β** (decay) | 0.5 → 4.0 | 5.9m → **151.3m** | 12.8d → 24.7d |
+| **μ** (baseline) | 0.005 → 0.001 | 5.9m → **4.4m** | 12.8d → **64.9d** |
+
+**The finding: the median IS the burst behaviour, and it is already realistic.** People genuinely do fire
+off texts a minute apart. Raising the median via α or β *destroys the bursts* — every message spaced 2+
+hours — which is **less** realistic, not more. The three parameters do different jobs:
+
+- **α / β** shape the *bursts* (tightness and length) — leave alone
+- **μ** sets the *silences between* bursts — the only lever that extends the span while preserving bursts
+
+**Conclusion: no Hawkes parameter was changed.** Phase-aware session gaps alone reached the target, so μ
+did not need touching — which preserves the literature grounding of `PHASE_PARAMETERS` (Aoki et al. 2016;
+Falkner et al. 2022). **The arc problem was never a Hawkes problem; it was a session-boundary problem**,
+as §22.3's third hypothesis anticipated.
+
+**The actual fix: `SESSION_GAP_HOURS`.** `force_gap_hours()` previously applied a fixed 4–24h gap
+regardless of what had just happened — phase-blind. This was both unrealistic and the main brake on the
+arc: the phases already model withdrawal *within* a session (`post_incident` has a ~17h baseline precisely
+because someone has pulled back), yet a session ending immediately after a relational incident resumed
+within a day like any other. After a real incident, contact resumes in **days**.
+
+| Phase | Gap (hours) | Rationale |
+|---|---|---|
+| `early_contact` | 4–24 (mean 14h) | later that day, or the next morning |
+| `escalation` | 2–12 (mean 7h) | contact resumes quickly while things are live |
+| `post_incident` | **16–72 (mean 44h)** | days of silence after a withdrawal |
+| `re_initiation` | 8–40 (mean 24h) | tentative re-contact after a break |
+
+`force_gap_hours()` now defaults to the current phase's range and returns the gap applied (logged).
+
+**Defaults bumped** — `max_turns` 60 → **120**, `max_sessions` 6 → **12**, SLURM `--time` 1h → **3h**.
+Sessions, not turns, drive the arc; 120 turns exist to *accommodate* 12 sessions. The exchange budget
+derives as (120/12)/2 = 5, so the configuration stays coherent (§23.6).
+
+**Result** (measured across three plausible phase trajectories, 120 turns / 12 sessions):
+
+| Trajectory | Span | Median gap |
+|---|---|---|
+| mostly early/escalation | **14d 12h** | 2.0 min |
+| balanced | 38d 10h | 25 min |
+| heavy post_incident | 53d 4h | 201 min |
+
+*(vs. run 6543856: 1d 11h, median 1.0 min, 2 gaps > 4h.)*
+
+The **floor is now ~14 days**, meeting the project's stated arc goal for the first time. The spread is a
+*feature*, not drift: it is phase-driven. A relationship that stays in escalation texts constantly across
+two weeks; one that reaches `post_incident` goes quiet for days and stretches to seven. The median tracks
+this correctly — 2 min in escalation (bursts intact), 201 min post-incident (someone has withdrawn) —
+which is the Hawkes model behaving as designed.
+
+**Caveat:** these figures come from *synthetic* phase trajectories driven by a fake provider. Real runs
+will vary. The numbers should be re-measured on the next real generation run before being reported.
+
+**Consequence for §22.3.** The planned Hawkes parameter study is now **largely redundant as an arc-length
+fix** — the arc was fixed without touching the parameters. It may still be worth running as a
+*sensitivity analysis* (demonstrating that the chosen parameters are justified rather than arbitrary), but
+it is no longer needed to reach the 14-day goal.
+
+### 23.9 — Start time moved to 2026
+
+`datetime(2024, 1, 1, 9, 0)` → `datetime(2026, 1, 5, 9, 0)`. The date is not arbitrary: the model **sees it
+on every history line**, so it must be a plausible working morning. 1 January was rejected as New Year's Day
+(a public holiday — deployment-pipeline discussions at 9am on New Year's Day are implausible, and the model
+could visibly react to the date). 5 January 2026 is a Monday. See §22.4 for the decision to hold it constant.
+
+---
+
+### Verification summary
+
+All fixes verified with a **fake `ModelProvider`** — canned JSON responses, no LLM and no GPU required. This
+is a cheap, reusable way to test pipeline control flow, and it is how the exhaustion bug was caught.
+
+| Fix | Verification |
+|---|---|
+| Taxonomy grounding | World loads and validates; definitions render into both prompts; bad/empty categories raise |
+| Beat categories | Enum-constrained in schema; parser rejects invalid keys |
+| Checkpointing | Killed mid-run → valid JSON, `complete: false`, no stray `.tmp`; full run → `complete: true` |
+| Exhaustion bug | Generator receives `None` past the plan; run stopped at turn 13 instead of grinding to 19 |
+| Variable beats | 1-exchange beat → 2 turns; 3-exchange beat → 6 turns |
+| Coherent budget | **6 sessions in exactly 60 turns** (previously impossible) |
+| Assessor session-end | Both triggers fire correctly; call breakdown confirms zero completion-query calls |
+| Phase-aware session gaps | Arc floor now **14d 12h** (was 1d 11h); parameter sweep confirmed mu is the only span lever that preserves bursts |
+
+**Note for the write-up:** the next generation run is **not comparable to run 6543856** — the prompts, the
+beat structure and the session mechanics have all changed. Tension figures must not be compared across this
+boundary.
+
+---
+
+## Section 24 — Runs 6641761 and 6642081: The Fixes Land, and the Generator Becomes the Bottleneck
+
+### 24.1 — Run 6641761: crashed at turn 36 — the `num_predict` defect
+
+The first run after the §23 assessment **crashed at turn 36 of 120**. The checkpointing added in §23.3
+did its job: the partial conversation survived with `complete: false` (before that change, the entire
+run would have been lost).
+
+**Root cause: `num_predict: 1024` in `OllamaModelProvider`.** From the SLURM log:
+
+```
+eval time = 7187.67 ms / 1024 tokens          <- hit the cap exactly
+Error: Ollama response parse failed; content was:      <- EMPTY
+Exception: Unable to complete llm query.               <- after 3 retries
+```
+
+The failure was `DialogueFlowQuery` planning session 5. The mechanism:
+
+**`gpt-oss:20b` is a reasoning model.** It emits chain-of-thought *before* the answer, and that reasoning
+is charged against the *same* `num_predict` budget as the answer. The §23.1 taxonomy grounding had grown
+the planner prompt to **2,110 tokens** (category definitions + workplace forms) and added a third
+planning axis (category, severity, *and* exchanges against a budget). The model spent its entire
+1,024-token allowance reasoning, was truncated before emitting any JSON, and returned **empty content**.
+Three retries produced the same result, and `LLMQuery.query()` raised.
+
+`num_predict: 1024` dated from when prompts were short and reasoning models were not in use. Against a
+44 GiB L40S serving a 32,768-token context, it was leaving ~96% of the budget unused.
+
+**A diagnostic failure as much as a code one.** The error read `content was: ` — nothing. An empty
+response from a truncated *reasoning* pass was indistinguishable from a total failure, because the
+provider only read `message.content` and Ollama returns reasoning separately in `message.thinking`.
+
+**Fixes applied to `OllamaModelProvider`:**
+1. `num_predict` **1024 → 4096** (~19% of context; 26.5k tokens spare).
+2. Read `message.thinking`, so truncated-mid-reasoning is distinguishable from no response.
+3. A real diagnostic — reports empty-vs-malformed content, `eval_count`, whether the cap was hit, and a
+   reasoning tail. Verified by replaying the exact response shape from the failing run.
+
+**Note on the test strategy.** No local test could have caught this: the `FakeModelProvider` never
+touches Ollama, so a real-model truncation behaviour is invisible to it. The suite proves the *control
+flow* is correct, not that the *model cooperates*. This limitation should be stated in the write-up
+rather than implying the tests cover everything.
+
+---
+
+### 24.2 — Run 6642081: the first complete run under the new architecture
+
+**Characters:** Sophie Walker + Ryan Chambers | **Model:** gpt-oss:20b | **100 turns, 12 sessions, complete**
+
+| Metric | 6543856 (best prior) | 6641761 (crashed) | **6642081** |
+|---|---|---|---|
+| Complete | ✓ | ✗ (36 turns) | **✓ (100 turns)** |
+| Sessions | ~2 | 4 | **12** |
+| **Simulated span** | 1d 11h | 2d 8h | **6d 16h** (4.5×) |
+| Median gap | 1.0 min | 2.0 min | **2.0 min** (bursts intact) |
+| Gaps > 4h | 2 | 6 | **12** (6×) |
+| Category coverage | — | 25% | **75%** |
+| Tension | 4/5 | 3/5 | **4/5** |
+
+#### What worked
+
+**The `num_predict` fix resolved more than the crash.** Category coverage went **25% → 75%** and
+cross-session topic repetition largely disappeared (**39 beats, 37 unique topics**, only 2 repeats —
+against "API endpoint naming" appearing in 3 of 4 sessions previously). Both had been diagnosed as
+separate problems; both were **the same truncation defect**. The assessor was being cut off
+non-fatally — emitting enough JSON to parse, but with a truncated `detected_categories` array — and the
+planner was reasoning under a budget too small to vary its topics.
+
+> **Consequence:** the §23.7 "task interference" risk is **not** substantiated. The assessor's six
+> outputs were not the problem, and it should **not** be split back out.
+
+**Session mechanics (§23.7) confirmed on real data.** 12 sessions in 100 turns; **12 gaps > 4h** against
+2 previously. Session ends now fire reliably.
+
+**Phase-aware gaps (§23.8) confirmed.** Span 4.5× longer while the median gap stayed at 2 minutes —
+i.e. the arc lengthened *without* damaging burstiness, exactly as the parameter sweep predicted and
+without touching a single Hawkes parameter.
+
+**The severity arc is the strongest result to date.** A monotone escalation across 12 sessions, never
+rising more than one tier per beat:
+
+```
+s1:  [1,2,2,2]     neutral opening
+s5:  [4,4,4]       sustained pressure
+s9:  [4,4,5]       first severity-5
+s12: [4,4,5]       climax
+```
+
+This is the STOP framework (Morabito et al.) doing precisely what it was adopted for, and is directly
+reportable.
+
+#### What did not work — the central finding
+
+**The plan reaches severity 5; the generated text does not.** Session 12's severity-5 beat:
+
+> *"Ryan directs Sophie to rewrite API documentation, claiming it needs her input but then
+> **re-attributes any suggestions back to him, effectively sidelining her**"*
+
+What was actually generated:
+
+> **Ryan:** "Rewrite the API docs for /customers/orders/list... Keep the style I used in the rate-limiting docs."
+> **Sophie:** "Sure, I'll rewrite the docs to match your style."
+
+**The re-attribution never occurs.** A severity-5 relational incident was flattened into ordinary task
+delegation. Hence **tension 4/5 but `incident_occurred: false`** — the assessor is correct; no incident
+happened.
+
+**This caps the arc.** The chain: no incident → phase never leaves `escalation` → `post_incident` is
+never entered → the **16–72h session gaps never fire** → span plateaus at 6d 16h. **The arc is limited
+by a content failure, not a timing one.** Resolving the incident would extend the arc for free.
+
+#### Secondary issues
+
+- **Stopped at 100/120 turns because it hit `max_sessions=12`**, not `max_turns`. Sessions came in at
+  ~8 turns against a planned 10 — the assessor ends them slightly early. Raise `max_sessions` if 120
+  turns are wanted.
+- **Ryan has acquired a catchphrase** — *"No need to ping again"* recurs verbatim. This is the
+  quoted-phrase templating failure of §11 re-emerging, but from a new cause: the model is latching onto
+  its **own earlier output** in the history rather than onto phrases in the character card. The §11 fix
+  (removing quoted phrases from the personality) cannot address this.
+- **Beat descriptions leak the perpetrator's script to the victim** (found in 6641761, unfixed). The
+  `description` field specifies character B's behaviour, but the beat is injected into
+  `CharacterMessageQuery` for **both** characters. In 6641761 this produced Sophie agreeing to organise
+  catering *one turn before Ryan asked her to*. Beats need to be perspective-aware: the victim should
+  receive the topic, not the perpetrator's intent.
+
+---
+
+### 24.3 — Why this run is the strongest evidence for the injector
+
+The architecture now demonstrably works: planning, escalation, categorisation, session mechanics and
+temporal modelling all deliver. **The generator is the bottleneck.** It receives an explicit,
+well-specified instruction — *"severity 5: he re-attributes her ideas and sidelines her"* — and writes a
+polite work request.
+
+This is precisely the gap the injector (§20.3) is designed to close: the planner controls *what* should
+happen and at *what intensity*; the generator cannot render it. The argument for fine-tuning no longer
+rests on the tension-plateau evidence of §20.1 alone — it can now be made concretely, by placing a
+planned severity-5 beat beside the bland text it produced.
+
+**Recommended framing for the write-up:** prompting can reliably control a conversation's *structure*
+(topic, escalation curve, category, timing) but not its *rendering*. A safety-aligned general-purpose
+model, instructed to produce a specific microaggression at a specific intensity, produces a plausible
+workplace message instead. Moving that competence into the weights is the motivation for Objective B.
+
+---
+
+## Section 25 — Duration-Based Termination, and Run 6664248: the Arc Goal Met
+
+### 25.1 — Changes since §24
+
+Four changes were made after run 6642081, before the run reported in §25.2.
+
+**Beat perspective leak — fixed.** `Beat.description` states the *perpetrator's* behaviour, but the
+beat was injected into `CharacterMessageQuery` for **both** characters, handing the victim his script.
+In run 6641761 this produced Sophie agreeing to organise catering **one turn before Ryan asked her to** —
+she was answering his planned line rather than anything he had said. The beat is now perspective-aware:
+both characters receive `Topic`, only the perpetrator receives `Dynamic`. This is also truer to SynDG,
+in which a generator realises *its own* beat rather than reading the other party's.
+*Caveat: no beat in 6664248 would have obviously exposed this, so it remains confirmed only by unit
+test, not in production.*
+
+**Termination changed from message count to simulated duration.** `max_turns` / `max_sessions` were
+proxies for a goal they only loosely tracked. The project's aim is an arc spanning ~2 weeks — a
+statement about **duration**, not message count. The evidence: 100 turns spanned 6d16h while the
+relationship stayed in escalation, but the same 100 turns in `post_incident` (44h session gaps) would
+have spanned ~40 days. Capping messages therefore cut conversations off at a number unrelated to the
+goal, and forced **every conversation to the same length regardless of what happened in it** — itself a
+visible artefact in a corpus.
+
+- `--target-days` (default 14) is now the termination condition.
+- **`max_sessions` deleted.** Sessions are unbounded.
+- `max_turns` demoted to a **circuit breaker** (300), documented as: if it fires, investigate.
+- `exchange_budget` is a direct parameter (5). Deriving it from `max_sessions` coupled two unrelated
+  things — raising the session ceiling silently shortened every session.
+
+Verified against synthetic phase trajectories: same 14-day target produced **210 turns** when the
+relationship stayed in escalation vs **80 turns** when it reached `post_incident`. Turn count is now
+emergent — a tense fortnight generates more messages than a withdrawn one.
+
+**Two tests rewritten, not patched.** Both leaned on `max_sessions=1` to isolate a session. The
+exhaustion integration test was asserting a `None` beat that is now unreachable (exhaustion ends the
+session immediately), so it was rewritten to assert the invariant the original bug actually violated:
+*no beat may occupy more consecutive turns than it budgeted for*. Suite now 14 tests.
+
+**Operational.** `notify.sh` rewritten to send a phone push (ntfy) at high priority alongside email;
+email arrived too late to be useful. Also fixed two latent defects in it: the "job done" email reported
+paths that never existed (`run_${JOB_ID}.json` vs the actual `${RUN_ID}.json`), and the failure email
+was `tail -30` of a log that is ~99% Ollama INFO noise — it now greps for the actual error.
+
+---
+
+### 25.2 — Run 6664248: the strongest run to date
+
+**Sophie Walker + Ryan Chambers | gpt-oss:20b | 96 turns, 11 sessions, complete**
+
+| Metric | 6543856 | 6642081 | **6664248** |
+|---|---|---|---|
+| Turns / sessions | 60 / ~2 | 100 / 12 *(hit ceiling)* | **96 / 11 — emergent** |
+| **Simulated span** | 1d 11h | 6d 16h | **15d 6h** ✅ *(target: 14)* |
+| **incident_occurred** | True | **False** | **True** ✅ |
+| **Final phase** | post_incident | escalation | **post_incident** ✅ |
+| **Category coverage** | — | 75% | **100%** ✅ |
+| Topic variety | — | 37/39 unique | **35/35 — zero repeats** |
+| Median gap | 1.0 min | 2.0 min | **2.0 min** (bursts intact) |
+| Gaps > 4h | 2 | 12 | **17** |
+| Tension | 4/5 | 4/5 | **4/5** |
+
+#### The arc goal is met, and the causal chain predicted in §24.2 is visible
+
+§24.2 argued the arc was capped by a *content* failure, not a timing one: no incident → phase never
+leaves `escalation` → `post_incident` never entered → its 16–72h gaps never fire. This run confirms
+the chain by completing it. The incident fired, and the multi-day silences followed:
+
+```
+after turn 85: 106.2h  (Fri 09 Jan -> Tue 13 Jan)   <- 4.4 days of withdrawal
+after turn 88:  48.8h  (Wed 14 Jan -> Fri 16 Jan)
+after turn 91:  48.1h  (Sun 18 Jan -> Tue 20 Jan)
+```
+
+**The incident itself** — a textbook `denial_of_reality_of_sexism`, and the first time the generator
+has rendered a severity-5 beat as an actual relational event rather than flattening it into ordinary
+task delegation (the §24.2 failure):
+
+> **Sophie (84):** "just double-checking if we captured all the points about bias from last week's
+> meeting—did I miss anything?"
+> **Ryan (85):** "**We're a meritocracy here; you just need to push harder and it will happen.**"
+>
+> *— 106 hours of silence —*
+>
+> **Ryan (95):** "I don't see any bias here—just overthinking. Lunch's handled."
+
+She raises bias; he invalidates it; she withdraws for four days. This is the arc the project set out to
+generate.
+
+**Duration termination confirmed on real data.** 15d 6h against a 14-day target — the overshoot is a
+106h gap carrying the clock past the target in a single jump, which is correct (a run cannot stop
+mid-gap). **96 turns**, not a round 100 or 120: the count is emergent.
+
+**Coverage reached 100%** — all four intended categories realised (25% → 75% → 100% across the
+`num_predict` fix and subsequent runs). **Topic variety is perfect**: 35 beats, 35 unique topics.
+
+**Severity arc**, now with realistic ebb and flow rather than a monotone ramp — note the dips at s6 and
+s9, i.e. tension receding before rising again:
+
+```
+s1: [1,2,2,3]   s3: [3,4,5]   s6: [2,3,4]   s8: [4,4,5,5]   s11: [4,5,5]
+```
+
+#### What is still not working
+
+**Sophie's catchphrase is now pathological.** *"Sorry if I'm over-checking"* appears in nearly every
+message she sends (turns 82, 84, 86, 88, 90, 94). This is the §11 quoted-phrase templating failure
+re-emerging **from a different cause**: she is copying **her own prior output** from the conversation
+history, not phrases in her character card. The §11 fix (removing quoted phrases from the personality)
+cannot address this, because the source is the history itself. Candidate approaches: penalise verbatim
+self-repetition in the persona filter, or vary the raw-history window.
+
+**Ryan has no post-incident register.** Turn 95 ("I don't see any bias here") is in the same voice as
+turn 5. His character card describes patience wearing thin *within* a conversation but says nothing
+about how he behaves *after* an incident — so the phase transition changes the timing but not his
+voice.
+
+**The generator still under-renders severity in the general case.** This run produced one genuine
+severity-5 incident, but severity-5 beats were planned in sessions 3, 4, 7, 8 and 11 — most of which
+did not produce incidents. The §24.3 argument stands: the planner controls *structure* reliably; the
+generator renders *intensity* only intermittently. That intermittency is precisely what the injector
+(§20.3) targets.
+
+#### Status against the project's stated goals
+
+| Goal | Status |
+|---|---|
+| Multi-day arc (~2 weeks) | **Met** — 15d 6h, emergent, not forced |
+| Topic control | **Met** — 35/35 unique topics |
+| Escalation structure | **Met** — planned severity arc with realistic ebb/flow |
+| Category control | **Met** — 100% of intended categories realised |
+| Realistic timing | **Met** — bursts (2 min median) with multi-day silences |
+| **Reliable rendering of intensity** | **Not met** — 1 of ~5 planned severity-5 beats became an incident |
+
+The architecture is delivering. The remaining gap is rendering, which is the fine-tuning objective.
 
 ---
