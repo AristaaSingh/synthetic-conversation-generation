@@ -15,6 +15,7 @@ and the timer updates accordingly. There are no hardcoded day thresholds.
 import argparse
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -57,6 +58,95 @@ logging.getLogger('openai').setLevel(logging.WARNING)
 logging.getLogger('anthropic').setLevel(logging.WARNING)
 
 
+def build_output(
+    conversation: Conversation,
+    state: ConversationState,
+    rolling_summary: "RollingSummary | None",
+    all_dialogue_flows: list[DialogueFlow],
+    commitment_cache: CommitmentCache,
+    character_a: CharacterCard,
+    character_b: CharacterCard,
+    world: World,
+    conversation_id: str,
+    complete: bool,
+) -> dict:
+    """
+    Serialise the full run state to a JSON-ready dict.
+
+    Used both for periodic checkpoints during generation and for the final write,
+    so a checkpoint file has exactly the same shape as a completed one — only the
+    `complete` flag differs.
+    """
+    return {
+        "conversation_id": conversation_id,
+        "world": world.title,
+        "characters": [character_a.name, character_b.name],
+        # False if this file is a mid-run checkpoint (e.g. the job was killed by a
+        # SLURM timeout). Consumers must check this before treating a run as finished.
+        "complete": complete,
+        "turns_generated": len(conversation.messages),
+        "vawg_categories": list(world.vawg_categories),
+        "commitment_cache": commitment_cache.to_dict_list(),
+        "dialogue_flows": [
+            {
+                "session_number": flow.session_number,
+                "beats": [
+                    {
+                        "topic": b.topic,
+                        "category": b.category,
+                        "severity": b.severity,
+                        "description": b.description,
+                    }
+                    for b in flow.beats
+                ],
+            }
+            for flow in all_dialogue_flows
+        ],
+        "rolling_summary": {
+            "events": rolling_summary.events,
+            "details": rolling_summary.details,
+            "open_threads": rolling_summary.open_threads,
+            "dynamic": rolling_summary.dynamic,
+        } if rolling_summary else None,
+        "final_state": {
+            "phase": state.phase,
+            "summary": state.summary,
+            "tension_level": state.tension_level,
+            "incident_occurred": state.incident_occurred,
+            "detected_categories": state.detected_categories,
+        },
+        "messages": [
+            {
+                "speaker": character_a.name if msg.role == ROLE.user else character_b.name,
+                "role": msg.role.name,
+                "timestamp": msg.timestamp.strftime("%Y-%m-%d %H:%M"),
+                "content": msg.content,
+            }
+            for msg in conversation.messages
+        ],
+    }
+
+
+def write_output(path: Path, data: dict) -> None:
+    """
+    Write the output JSON atomically.
+
+    A plain `open(path, "w")` followed by `json.dump` is not safe here: a run can be
+    killed mid-write by a SLURM timeout, which would leave a truncated, unparseable
+    file — and, for checkpoints, would destroy the previously good checkpoint it was
+    overwriting. Writing to a temporary file in the same directory and then calling
+    os.replace() makes the swap atomic on POSIX, so the destination always contains
+    either the previous complete checkpoint or the new one, never a half-written mix.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        f.write(json.dumps(data, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def run_pipeline(
     model_provider: ModelProvider,
     model_id: str,
@@ -68,6 +158,7 @@ def run_pipeline(
     max_sessions: int = 6,
     conversation_start_time: datetime | None = None,
     hawkes_seed: int | None = None,
+    output_path: Path | None = None,
 ) -> Conversation:
     """
     Generate a single synthetic conversation spanning multiple sessions.
@@ -113,6 +204,26 @@ def run_pipeline(
 
     # Beats advance every this many turns within a session (one full exchange = 2 turns).
     _TURNS_PER_BEAT = 2
+
+    def checkpoint(complete: bool = False) -> None:
+        """Persist current progress so a timeout or crash does not lose the run."""
+        if output_path is None:
+            return
+        write_output(
+            output_path,
+            build_output(
+                conversation=conversation,
+                state=state,
+                rolling_summary=rolling_summary,
+                all_dialogue_flows=all_dialogue_flows,
+                commitment_cache=commitment_cache,
+                character_a=character_a,
+                character_b=character_b,
+                world=world,
+                conversation_id=conversation_id,
+                complete=complete,
+            ),
+        )
 
     # Dialogue flow pre-planning (SynDG, Bao et al., ACL 2023):
     # the session's topic arc is determined before any messages are generated.
@@ -275,6 +386,11 @@ def run_pipeline(
                 )
             commitment_cache.evict_stale(len(conversation.messages))
 
+            # Persist progress after every exchange. Cheap relative to the 3+ LLM
+            # calls that just ran, and means a SLURM timeout costs at most one
+            # exchange rather than the entire run.
+            checkpoint()
+
             session_ended = ConversationCompletionQuery(
                 model_provider=model_provider,
                 model_id=model_id,
@@ -313,6 +429,7 @@ def run_pipeline(
                     + " | ".join(f"[{b.severity}/{b.category or 'none'}] {b.topic}" for b in dialogue_flow.beats)
                 )
 
+    checkpoint(complete=True)
     return conversation, state, rolling_summary, all_dialogue_flows, commitment_cache
 
 
@@ -354,6 +471,8 @@ if __name__ == "__main__":
 
     logger.info(f"Starting pipeline: {character_a.name} ↔ {character_b.name} | {world.title}")
 
+    # run_pipeline checkpoints to output_path after every exchange and writes a
+    # final complete=True version on exit, so no separate write is needed here.
     conversation, final_state, rolling_summary, all_dialogue_flows, commitment_cache = run_pipeline(
         model_provider=model_provider,
         model_id=args.model_id,
@@ -364,55 +483,8 @@ if __name__ == "__main__":
         max_turns=args.max_turns,
         max_sessions=args.max_sessions,
         hawkes_seed=args.hawkes_seed,
+        output_path=Path(args.output_path),
     )
-
-    Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
-    output = {
-        "conversation_id": args.conversation_id,
-        "world": world.title,
-        "characters": [character_a.name, character_b.name],
-        "commitment_cache": commitment_cache.to_dict_list(),
-        "dialogue_flows": [
-            {
-                "session_number": flow.session_number,
-                "beats": [
-                    {
-                        "topic": b.topic,
-                        "category": b.category,
-                        "severity": b.severity,
-                        "description": b.description,
-                    }
-                    for b in flow.beats
-                ],
-            }
-            for flow in all_dialogue_flows
-        ],
-        "rolling_summary": {
-            "events": rolling_summary.events,
-            "details": rolling_summary.details,
-            "open_threads": rolling_summary.open_threads,
-            "dynamic": rolling_summary.dynamic,
-        } if rolling_summary else None,
-        "final_state": {
-            "phase": final_state.phase,
-            "summary": final_state.summary,
-            "tension_level": final_state.tension_level,
-            "incident_occurred": final_state.incident_occurred,
-            "detected_categories": final_state.detected_categories,
-        },
-        "messages": [
-            {
-                "speaker": character_a.name if msg.role == ROLE.user else character_b.name,
-                "role": msg.role.name,
-                "timestamp": msg.timestamp.strftime("%Y-%m-%d %H:%M"),
-                "content": msg.content,
-            }
-            for msg in conversation.messages
-        ],
-    }
-
-    with open(args.output_path, "w") as f:
-        f.write(json.dumps(output, indent=2))
 
     print(f"Saved {len(conversation.messages)} messages to {args.output_path}")
     print(f"Final state: {final_state.phase} | tension {final_state.tension_level}/5 | incident: {final_state.incident_occurred}")
