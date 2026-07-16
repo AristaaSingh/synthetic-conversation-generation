@@ -13,7 +13,19 @@ relationship: >
   the team. Neither thinks of the relationship as more than collegial, though
   they are friendly enough to send the occasional off-topic message.
 
-vawg_category: STEREOTYPING-DOMINANCE, IDEOLOGICAL-INEQUALITY
+# Canonical microaggression categories in scope for this world + character pairing.
+# Keys must match data_models/microaggression_taxonomy.py (Capodilupo et al., 2010,
+# as validated by WoMenS). This is the palette the dialogue-flow planner draws from.
+#
+# Chosen to match how the perpetrator is actually written: Ryan over-explains,
+# re-attributes her conclusions, and dismisses her follow-ups. He is not written as
+# someone who comments on appearance or uses slurs, so `sexual_objectification` and
+# `use_of_sexist_language` are deliberately out of scope here.
+vawg_categories:
+  - assumptions_of_inferiority      # over-explaining, checking her work, patronising
+  - second_class_citizenship        # re-attributing her ideas, assuming she defers
+  - traditional_gender_roles        # steering her to the "people" side, not the technical
+  - denial_of_reality_of_sexism     # "it was just a joke", "you're overthinking it"
 
 character_a_role: >
   Software engineer. Works on backend services and API design. Has been at the

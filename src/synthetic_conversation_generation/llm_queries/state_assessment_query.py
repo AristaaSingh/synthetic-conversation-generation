@@ -1,6 +1,7 @@
 from synthetic_conversation_generation.data_models.conversation import Conversation, ROLE
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.data_models.conversation_state import ConversationState
+from synthetic_conversation_generation.data_models.microaggression_taxonomy import is_valid
 from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
 
@@ -49,8 +50,10 @@ class StateAssessmentQuery(LLMQuery):
 {self.character_a.name}: {self.character_a.personality.strip()}
 {self.character_b.name}: {self.character_b.personality.strip()}
 
-This conversation is categorised as: {self.world.vawg_category}
-Look for patterns consistent with this category — they may be subtle or indirect.
+Microaggression categories relevant to this setting:
+{self.world.category_definitions()}
+
+Look for patterns consistent with these categories — they may be subtle or indirect.
 
 Previous state: {self.previous_state.summary}
 Phase: {self.previous_state.phase} | Tension: {self.previous_state.tension_level}/5
@@ -68,7 +71,7 @@ Assess the current state of the relationship. Determine:
 
    Only move to a later phase if the conversation content justifies it. Do not revert to an earlier phase.
 
-2. **summary** — a 2-3 sentence description of where the relationship actually is right now. What has happened? What is the emotional undercurrent? What does each person actually feel, as distinct from what they are saying? Include any patterns of {self.world.vawg_category} that are present, even if subtle — this summary is injected into every future message generation turn and must carry this signal forward.
+2. **summary** — a 2-3 sentence description of where the relationship actually is right now. What has happened? What is the emotional undercurrent? What does each person actually feel, as distinct from what they are saying? Include any microaggression patterns from the categories above that are present, even if subtle — this summary is injected into every future message generation turn and must carry this signal forward.
 
 3. **tension_level** — an integer from 1 to 5:
    1 = completely neutral, nothing loaded
@@ -86,6 +89,8 @@ Assess the current state of the relationship. Determine:
    wearing on the other's patience across several turns.
 
 4. **incident_occurred** — true if a significant relational event has happened (an explicit confrontation, a moment of clarity for either character, a withdrawal, something that marks a before/after). False if the conversation is still in ordinary flow.
+
+5. **detected_categories** — which of the microaggression categories listed above are actually present in the conversation so far, based on what has been said. Use the exact category keys. Return an empty list if none are genuinely present — do not list a category just because it was expected.
 """
 
     def response_schema(self):
@@ -108,9 +113,17 @@ Assess the current state of the relationship. Determine:
                 "incident_occurred": {
                     "type": "boolean",
                     "description": "Whether a significant relational event has occurred"
+                },
+                "detected_categories": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": list(self.world.vawg_categories),
+                    },
+                    "description": "Microaggression categories actually present in the conversation so far"
                 }
             },
-            "required": ["phase", "summary", "tension_level", "incident_occurred"],
+            "required": ["phase", "summary", "tension_level", "incident_occurred", "detected_categories"],
             "additionalProperties": False
         }
 
@@ -119,9 +132,16 @@ Assess the current state of the relationship. Determine:
         if phase not in self.VALID_PHASES:
             phase = self.previous_state.phase
 
+        # Validate rather than trust: Ollama does not hard-enforce enums.
+        detected = [
+            c for c in json_response.get("detected_categories", []) or []
+            if is_valid(str(c).strip())
+        ]
+
         return ConversationState(
             phase=phase,
             summary=json_response.get("summary", self.previous_state.summary),
             tension_level=max(1, min(5, int(json_response.get("tension_level", self.previous_state.tension_level)))),
             incident_occurred=json_response.get("incident_occurred", self.previous_state.incident_occurred),
+            detected_categories=detected,
         )

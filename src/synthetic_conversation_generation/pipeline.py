@@ -132,7 +132,7 @@ def run_pipeline(
     all_dialogue_flows.append(dialogue_flow)
     logger.info(
         f"Session {session_count_for_flow} flow planned: "
-        + " | ".join(f"[{b.severity}] {b.topic}" for b in dialogue_flow.beats)
+        + " | ".join(f"[{b.severity}/{b.category or 'none'}] {b.topic}" for b in dialogue_flow.beats)
     )
     session_turn_count = 0
 
@@ -310,7 +310,7 @@ def run_pipeline(
                 all_dialogue_flows.append(dialogue_flow)
                 logger.info(
                     f"Session {session_count_for_flow} flow planned: "
-                    + " | ".join(f"[{b.severity}] {b.topic}" for b in dialogue_flow.beats)
+                    + " | ".join(f"[{b.severity}/{b.category or 'none'}] {b.topic}" for b in dialogue_flow.beats)
                 )
 
     return conversation, state, rolling_summary, all_dialogue_flows, commitment_cache
@@ -376,7 +376,12 @@ if __name__ == "__main__":
             {
                 "session_number": flow.session_number,
                 "beats": [
-                    {"topic": b.topic, "severity": b.severity, "description": b.description}
+                    {
+                        "topic": b.topic,
+                        "category": b.category,
+                        "severity": b.severity,
+                        "description": b.description,
+                    }
                     for b in flow.beats
                 ],
             }
@@ -393,6 +398,7 @@ if __name__ == "__main__":
             "summary": final_state.summary,
             "tension_level": final_state.tension_level,
             "incident_occurred": final_state.incident_occurred,
+            "detected_categories": final_state.detected_categories,
         },
         "messages": [
             {

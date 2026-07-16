@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -15,3 +15,9 @@ class ConversationState:
     summary: str         # brief narrative description of the current dynamic
     tension_level: int   # 1 (neutral) to 5 (acute conflict or crisis)
     incident_occurred: bool  # whether a significant event has happened yet
+
+    # Canonical microaggression categories the assessor judges to be ACTUALLY
+    # present, as distinct from those the dialogue-flow planner INTENDED. The gap
+    # between intended (Beat.category) and realised (this field) is itself an
+    # evaluation signal: it measures whether the generator delivered the plan.
+    detected_categories: list[str] = field(default_factory=list)

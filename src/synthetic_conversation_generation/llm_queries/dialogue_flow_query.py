@@ -10,6 +10,7 @@
 from synthetic_conversation_generation.data_models.character_card import CharacterCard
 from synthetic_conversation_generation.data_models.conversation_state import ConversationState
 from synthetic_conversation_generation.data_models.dialogue_flow import Beat, DialogueFlow
+from synthetic_conversation_generation.data_models.microaggression_taxonomy import is_valid
 from synthetic_conversation_generation.data_models.world import World
 from synthetic_conversation_generation.llm_queries.llm_query import LLMQuery, ModelProvider
 from synthetic_conversation_generation.llm_queries.rolling_summary_query import RollingSummary
@@ -77,9 +78,13 @@ class DialogueFlowQuery(LLMQuery):
 Setting: {self.world.setting.strip()}
 {self.character_a.name}'s role: {self.world.character_a_role.strip()}
 {self.character_b.name}'s role: {self.world.character_b_role.strip()}
-VAWG category: {self.world.vawg_category}
 {prior_context}
 Produce exactly {self.beats_per_session} beats. Each beat is realised as approximately 2 text messages (one exchange). Together they form a coherent session arc.
+
+Each beat is defined on two independent axes: WHICH KIND of dynamic is in play (category), and HOW INTENSE it is (severity).
+
+Microaggression categories available in this setting:
+{self.world.category_definitions()}
 
 Severity tiers (STOP framework):
 1 = neutral — no problematic dynamic present
@@ -93,7 +98,8 @@ Rules:
 - Escalate gradually — each beat may stay the same or rise by at most 1 severity point
 - Each beat must name a concrete, real-world topic being discussed (e.g. "deployment pipeline error", "team meeting scheduling", "code review feedback")
 - Topics must vary across beats — do not repeat the same subject
-- The description must specify {self.character_b.name}'s concrete behaviour in that beat, not a generic characterisation
+- Assign each beat a category from the list above, matching {self.character_b.name}'s behaviour in that beat. Vary the categories across the session — do not use the same one for every beat. Use "none" only for a severity-1 beat where no problematic dynamic is present.
+- The description must specify {self.character_b.name}'s concrete behaviour in that beat, not a generic characterisation, and must be consistent with the category assigned to it
 """
 
     def response_schema(self):
@@ -111,6 +117,13 @@ Rules:
                                 "type": "string",
                                 "description": "Concrete subject being discussed"
                             },
+                            "category": {
+                                "type": "string",
+                                # Enum-constrained to the world's in-scope categories so the
+                                # planner cannot invent one. "none" is permitted for neutral beats.
+                                "enum": list(self.world.vawg_categories) + ["none"],
+                                "description": "Which microaggression category is in play in this beat"
+                            },
                             "severity": {
                                 "type": "integer",
                                 "minimum": 1,
@@ -121,7 +134,7 @@ Rules:
                                 "description": f"Specific behaviour {self.character_b.name} exhibits in this beat"
                             }
                         },
-                        "required": ["topic", "severity", "description"],
+                        "required": ["topic", "category", "severity", "description"],
                         "additionalProperties": False
                     }
                 }
@@ -131,12 +144,18 @@ Rules:
         }
 
     def parse_response(self, json_response) -> DialogueFlow:
-        beats = [
-            Beat(
+        beats = []
+        for b in json_response["beats"]:
+            # Defensive: Ollama does not hard-enforce enums the way the OpenAI/Anthropic
+            # providers do, so validate rather than trust. An unrecognised or "none"
+            # category becomes None (a neutral beat) instead of propagating a bad key.
+            raw_category = str(b.get("category", "none")).strip()
+            category = raw_category if is_valid(raw_category) else None
+
+            beats.append(Beat(
                 topic=b["topic"],
                 severity=max(1, min(5, int(b["severity"]))),
                 description=b["description"],
-            )
-            for b in json_response["beats"]
-        ]
+                category=category,
+            ))
         return DialogueFlow(session_number=self.session_number, beats=beats)

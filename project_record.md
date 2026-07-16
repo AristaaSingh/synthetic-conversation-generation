@@ -1444,6 +1444,12 @@ This makes commitment extraction auditable in every run output.
 
 ### Microaggression taxonomy source (Lagos Rojas et al., CHI 2026)
 
+> **⚠️ SUPERSEDED — see §21.2.** The CHI 8-category scheme described below was the initial choice and
+> was **rejected on empirical grounds** on 2026-07-15: it left two categories with zero Biasly support
+> and one with 42. The canonical taxonomy is now **Capodilupo et al. (2010), 6 categories**. The CHI
+> paper remains cited for its workplace lens and its LLM-judge ceiling-rating finding. This subsection
+> is retained as a record of the decision path, not as current design.
+
 Read "*Are Compliments Bad Now?*: Comparing LLMs and Human Interpretations of Gender Microaggressions in the Workplace" (Lagos Rojas, Genç, Bozzon, Colombo — CHI 2026). It is a detection/interpretation study, not a generation one, but yields two things directly useful to this project:
 
 1. **A validated 8-category workplace gender microaggression taxonomy** (built on Sue et al., Gartner, and Kim & Meister's STEM framework): undermining competence, sexual objectification, gender hostility, pathologizing character, gender as liability, restrictive gender roles, denial of experience/invalidation, exclusion. This is a concrete replacement for the current vague free-text `vawg_category` field.
@@ -1493,12 +1499,538 @@ This is not a committed plan — it is a set of directions under consideration w
 - Commitment cache (context retention)
 
 **Directions being explored (order/priority TBD, pending supervisor):**
-- *Taxonomy grounding* — wiring the 8-category microaggression taxonomy into the pipeline (see above). Attractive to do before any large-scale generation so runs come out auto-labelled, but not yet decided.
+- *Taxonomy grounding* — wiring the canonical microaggression taxonomy into the pipeline (see above; the scheme has since been revised to Capodilupo 6 — §21.2). Attractive to do before any large-scale generation so runs come out auto-labelled, but not yet decided.
 - *Corpus generation at scale* — running the pipeline to produce a dataset; doubles as fine-tuning material if that route is taken.
 - *Evaluation harness* (Elo / DeepEval) — would give a quality baseline; design must account for the LLM-judge ceiling-rating warning.
 - *Fine-tuning* (LoRA/QLoRA, DITTO-grounded) — dependent on corpus + a decision on data source and base model, both open questions for the supervisor.
 - *GPU-level KV caching* — only relevant if the project moves to direct model loading (which fine-tuning would require); may be background/inspiration rather than a deliverable — awaiting clarification.
 
 These interconnect (e.g. taxonomy grounding feeds corpus quality; evaluation brackets any fine-tuning) but the entry point depends on the supervisor's steer.
+
+---
+
+## Section 19 — Supervisor Direction, Dataset Acquisition, and Data Audit
+
+### Supervisor decision (2026-07-09)
+
+Fine-tuning is **approved**. The supervisor directed the project toward fine-tuning using MentalManip
+"or whatever data we can find," and supplied five further papers: **Biasly**, **Hollywood Identity
+Bias**, **Microaggressions in the Wild**, **WoMenS**, and **Violence Rating Prediction from Movie
+Scripts**.
+
+### Assessment of the five new papers
+
+| Paper | What it is | Verdict |
+|---|---|---|
+| **Biasly** (Findings of ACL 2024) | 10k expert-annotated **movie-subtitle** datapoints: subtle misogyny, 12-category multi-label, **continuous severity 0–1000**, plus a **parallel rewrite corpus** | **Strongest fit — primary dataset** |
+| **Microaggressions in the Wild** (EMNLP 2019) | The **SELFMA** dataset — microaggressions.com self-reports + a 4-theme/12-sub-theme typology | Real-dialogue anchor + taxonomy |
+| **Hollywood Identity Bias** (LREC 2022) | 35 movie scripts, dialogue-turn-level bias annotation *with surrounding context*; 7 bias types | Method interest (its context-window annotation mirrors ours); gender is only 1 of 7 types |
+| **WoMenS** (Counseling Psychologist 2025) | **Not a dataset** — a validated psychometric *scale*, 8 factors from Capodilupo/Sue | Psychometric grounding for the taxonomy |
+| **Violence Rating Prediction** (AAAI 2019) | Predicts movie violence rating (0–5) from script language | Conceptual only: severity-rating-from-text as an evaluation pattern |
+
+A clear pattern: four of the five (with MentalManip) are **movie/script derived** — the supervisor is
+steering toward sources that provide *multi-turn dialogue with characters*, which tweets and emails
+(EXIST, ToxiScope) cannot.
+
+### Three candidate fine-tuning objectives — decision
+
+The datasets support three genuinely different fine-tunes. **Decision: pursue B + C; revisit A only if
+time permits.**
+
+- **A — Generator / persona (DITTO-style).** Fine-tune the model to hold character without heavy
+  prompting. Data: own corpus + MentalManip. *Deferred.*
+- **B — Generator / content grounding.** Fine-tune the generator on real misogyny so it stops producing
+  bland output (attacks the tension-plateau-at-2 problem). Data: **Biasly** (+ SELFMA anchor). **Selected.**
+- **C — Evaluator.** Fine-tune a **severity/category classifier on Biasly** and use *that* as the evaluation
+  instrument — rather than a naive LLM judge, which the CHI paper shows ceiling-rates microaggressions
+  (4.7–5.0, near-zero variance) and cannot discriminate. **Selected.**
+
+**Critical-path insight: build C before B.** The evaluator is the measuring instrument; it is needed to
+establish a baseline and to demonstrate that B produced a measurable improvement. *Build the ruler before
+claiming the line got longer.*
+
+---
+
+### Data audit (Phase 1 — complete)
+
+Both datasets downloaded, parsed, and audited against the real files (not the papers).
+
+#### Biasly — `biasly_dataset.csv` (6.2 MB) + `biasly_raw_dataset.csv` (114 MB)
+
+- **30,000 annotations = 10,000 datapoints × 3 annotators**; 10 annotators (5 Linguistics, 5 Gender Studies, evenly split)
+- `is_misogynistic`: Yes **5,600** / No 24,332 / Unclear 68 (per annotation). Paper's datapoint-level aggregation (misogynistic if ≥1 annotator agrees) → **3,159 positives (31.59%)**
+- `original_severity`: **continuous 0–1000**, mean 344.8, sd 209.1 — matches the paper exactly
+- `rewrite` / `rewrite_severity`: **2,977 parallel pairs**; severity drops 344.8 → 53.6
+- `biasly_raw_dataset.csv`: 1.22 M *unlabelled* datapoints (for domain adaptation, not supervised training)
+
+**Category distribution (the key finding):**
+
+| Category | n |
+|---|---|
+| **Trivialization** (infantilizing/paternalistic) | **2,227** |
+| **Gender essentialism / stereotypes** | **1,841** |
+| Sexualization (appearance, degrading language) | 966 |
+| **Lacking autonomy or agency** | **733** |
+| Gendered slurs | 493 |
+| Objectification/sexualization | 417 |
+| Dehumanization | 370 |
+| Domestic violence / VAW | 313 |
+| Rape / sexual violence | 251 |
+| Phallocentrism | 199 |
+| Intersectional misogyny | 148 |
+| Anti-feminism | 52 |
+| Transmisogyny/Homophobia | 43 |
+
+The **top three by a wide margin — Trivialization, Gender essentialism, Lacking autonomy — are precisely
+the subtle workplace-microaggression categories the Sophie/Ryan dynamic is built on** (patronising,
+stereotyping, denying agency). ~4,800 real examples in exactly the target register.
+
+#### SELFMA — `microaggressions_v1.json` (JSONL, 1.9 MB) + `SelfMA Annotations.xlsx`
+
+- **3,240 raw posts**; tags: race 1,416, **gender 1,411**, sexuality 486, …
+- Annotation sheet: 2,932 posts listed, **1,300 typology-labelled**; joined on `Post ID` → **491 labelled gender posts**
+- **Gender posts by type:** text 637, quote 580, **chat 153**, photo 27, link 8, video 6
+- **The valuable find: 153 gender-tagged `chat` posts are real multi-turn dialogues** (mean **4.7 turns**, range 1–16), of which **30 are workplace-set**
+- Gender sub-themes: Stereotype 185, Objectification 125, Second-Class Citizen 83, Abnormality 81, Denial of Lived Exp. 38, Erasure 27, Ownership 23, Monolith 21, Myth of Meritocracy 11, Overt Aggression 11
+
+#### Recalibration forced by the audit
+
+**Biasly is the workhorse; SELFMA is a taxonomy source and a small real-dialogue anchor.**
+
+| | Biasly | SELFMA |
+|---|---|---|
+| Gender-specific | By construction | 1,411 of 3,240 (must filter) |
+| Labelled examples | **5,600** annotations / 3,159 datapoints | 491 gender-labelled |
+| Severity | **Continuous 0–1000** | None |
+| Parallel rewrites | **2,977 pairs** | None |
+| Real dialogues | Movie-subtitle chunks | **153** (30 workplace) |
+
+Both **B and C therefore run on Biasly.** SELFMA contributes the Breitfeller typology and ~153 real
+gender dialogues (30 workplace) as a qualitative grounding and evaluation reference set.
+
+### Data defects found (must be handled before training)
+
+1. Biasly's `misogynistic_inferences` is **`;`-separated** — splitting on commas shatters category names that
+   contain commas.
+2. `"Add optional explanation"` (n=635) is an **annotation-UI artefact**, not a category.
+3. Biasly has **two overlapping sexualization labels** (966 + 417) from a mid-annotation taxonomy revision —
+   must be merged (→ 1,383).
+4. The SELFMA annotation sheet has **no gender tag** — the `tags` field lives only in the raw JSON; join on `Post ID`.
+5. SELFMA dialogues are in the **`transcript` field of `type == "chat"` records** (a list of `SPEAKER:: line`
+   strings), *not* in `quote`. This is the only place real multi-turn dialogue exists.
+
+### Canonical taxonomy
+
+Four overlapping schemes are now in play (CHI 8, WoMenS 8, Biasly 12, SELFMA 4/12). A single canonical
+taxonomy and a full cross-dataset mapping have been defined in **`taxonomy_mapping.md`**.
+*(The canonical anchor was initially the CHI 8; it was revised to **Capodilupo 6** on empirical
+grounds — see §21.2.)*
+Notable: CHI, WoMenS and SELFMA all descend from Sue (2007) / Capodilupo (2010) and converge closely;
+**Biasly is the outlier** (built inductively from annotator observation of movie subtitles), and
+reconciling it is the substance of that document.
+
+### Taxonomy provenance — where each category scheme comes from (CITE THESE)
+
+The canonical scheme is not invented for this project; it is assembled from a documented lineage.
+This matters for the write-up: the convergence of a **psychometric scale**, an **HCI study**, and two
+independent **NLP datasets** on the same underlying taxonomy gives it triangulated grounding.
+
+**Foundational theory (the root of everything below):**
+- **Sue, D. W., Capodilupo, C. M., Torino, G. C., Bucceri, J. M., Holder, A. M. B., Nadal, K. L., & Esquilin, M. (2007).** Racial microaggressions in everyday life: Implications for clinical practice. *American Psychologist*, 62(4), 271–286.
+  → The origin of the microaggression construct and the microassault / microinsult / microinvalidation distinction. Every scheme below descends from this.
+- **Capodilupo, C. M., Nadal, K. L., Corman, L., Hamit, S., Lyons, O. B., & Weinberg, A. (2010).** The manifestation of gender microaggressions. In D. W. Sue (Ed.), *Microaggressions and Marginality: Manifestation, Dynamics, and Impact* (pp. 193–216). Wiley.
+  → The **gender-specific 7 themes** (sexual objectification, second-class citizenship, assumptions of inferiority, assumptions of traditional gender roles, denial of the reality of sexism, use of sexist language, environmental). This is the direct ancestor of both the CHI 8 and the WoMenS factors.
+
+**Domain-specific extensions used by the CHI paper:**
+- **Gartner, R. E., & Sterzing, P. R.** — campus-based gender microaggression themes (invisibility, presumed incompetence, sexual objectification, caretaker/nurturer expectations, etc.), as cited in Lagos Rojas et al.
+- **Kim, J. Y., & Meister, A. (2023).** Microaggressions, Interrupted: The experience and effects of gender microaggressions for women in STEM. *Journal of Business Ethics*, 185(3), 513–531.
+  → The **workplace/STEM** taxonomy (devaluation of technical competence, devaluation of physical presence, denial of one's reality, pathologizing character, pathologizing gender). This is what makes the CHI scheme workplace-appropriate — directly relevant to our UK tech-company world.
+
+**The four schemes actually mapped in `taxonomy_mapping.md`:**
+- **Lagos Rojas, C., Genç, H. U., Bozzon, A., & Colombo, S. (2026).** "Are Compliments Bad Now?": Comparing LLMs and Human Interpretations of Gender Microaggressions in the Workplace. *Proceedings of CHI 2026*, Article 1519.
+  → The 8-category workplace scheme. Built by integrating Sue (2007) + Gartner + Kim & Meister (2023). **Was the canonical anchor; superseded by Capodilupo 6 (§21.2).** Still cited for the workplace lens and as the source of the LLM-judge ceiling-rating finding that motivates Objective C.
+- **Miyake, E., Ahn, L. H., Tran, A. G. T. T., & Atkin, A. L. (2025).** Women's Microaggressions Scale (WoMenS): A Comprehensive Sexism Scale. *The Counseling Psychologist*, 53(2), 174–209.
+  → **Psychometric validation** (EFA + CFA, 8-factor bifactor structure) of the Capodilupo gender themes. Not data — this is what lets us claim the taxonomy is *measured*, not merely asserted.
+- **Sheppard, B., Richter, A., Cohen, A., Smith, E. A., Kneese, T., Pelletier, C., Baldini, I., & Dong, Y. (2024).** Biasly: An Expert-Annotated Dataset for Subtle Misogyny Detection and Mitigation. *Findings of the Association for Computational Linguistics: ACL 2024*, 427–452.
+  → **The 12 misogyny categories + continuous severity (0–1000) + 2,977 parallel rewrites.** Derived *inductively* from expert annotators (linguistics + gender studies), not from Sue — which is exactly why it is the outlier requiring reconciliation.
+- **Breitfeller, L., Ahn, E., Jurgens, D., & Tsvetkov, Y. (2019).** Finding Microaggressions in the Wild: A Case for Locating Elusive Phenomena in Social Media Posts. *Proceedings of EMNLP-IJCNLP 2019*, 1664–1674.
+  → **The SELFMA 4-theme / 12-sub-theme typology** (Attributive, Institutionalized, Forced Teaming, Othering). Explicitly built "upon the work of Sue et al. (2007)". Also the source of the 153 real gender dialogues.
+
+**Note for the write-up:** the CHI paper's own scenarios were drawn from microaggressions.com — i.e. from the *same* source corpus as SELFMA. The lineage is therefore genuinely interlocking, not a coincidental overlap, and should be presented as such.
+
+---
+
+## Section 20 — The Case for Fine-Tuning, the Failure of the Traditional Route, and the Injector Proposal
+
+> **Purpose.** This section consolidates the argument for the fine-tuning approach into a single
+> narrative for the dissertation. It answers three questions in order: *why* fine-tuning was needed,
+> *why* the conventional approach proved unviable, and *what* the proposed alternative is.
+
+---
+
+### 20.1 — Why fine-tuning was needed: the evidence from the generation runs
+
+Fine-tuning was not adopted for novelty. It was adopted because a specific, reproducible failure
+persisted across six consecutive runs *despite* four successive architectural interventions.
+
+**The core failure: the VAWG signal plateaus.**
+
+| Run | Configuration | Tension reached | Note |
+|---|---|---|---|
+| 6535962 | Rolling summary absent | **1/5** | 60 turns, zero VAWG content, no incident |
+| 6543401 | + persistent VAWG signal, rolling summary | **2/5** | First detection; plateaued |
+| 6543618 | + open_threads fix, register fixes | **2/5** | Language natural, VAWG still buried |
+| 6543623 | + Ryan Chambers (harsher perpetrator) | **2/5** | Plateau survived a character redesign |
+| 6543856 | + SynDG dialogue flow, STOP severity, PSYDIAL filter | **4/5** | Best result — but required *planning the escalation in* |
+
+**What this sequence demonstrates.** Every intervention was architectural (state assessment, rolling
+summarisation, persona redesign, dialogue-flow pre-planning, persona filtering). Each improved
+*something* — topic diversity, naturalness, persona distinctiveness — but tension sat at **2/5** until
+the escalation was explicitly pre-planned by the SynDG beats. In other words: **the model will follow
+an escalation plan, but it does not know how to render subtle misogyny convincingly on its own.**
+
+Three specific symptoms recur in the run logs:
+
+1. **Warmth drowns the signal (Run 6543618).** James was "relentlessly encouraging — *You've got this!*,
+   *You're crushing it!*" The most VAWG-consistent moment in 60 turns ("newbies will appreciate the
+   consistency") appeared twice and was never developed. The model defaults to pleasant.
+2. **Patterns do not accumulate (Run 6543623).** Ryan told Sophie "no need to ping unless there's a
+   blocker" at turns 13, 15, 17 and 26. A real person's patience would visibly fray; the model
+   regenerated the same patient brevity each time. It has no model of *escalating* interpersonal friction.
+3. **Persona drift requires a filter to catch (Sections 15–16).** The PSYDIAL retry loop exists precisely
+   because the model does not reliably stay in character — the behaviour lives in the prompt, not the weights.
+
+**The diagnosis.** All realism currently comes from an elaborate *prompt scaffold* rebuilt every turn
+(personality + beat + state summary + commitments + history). The base model is a general-purpose,
+safety-aligned assistant being *instructed* to act. This is fragile, contradicts the project's stated
+"minimal prompt engineering" principle, and — critically — **prompting cannot teach the model what it does
+not know how to render.** Fine-tuning is the mechanism for moving that competence from the prompt into
+the weights. Grounded in **DITTO (Lu et al., ACL 2024)**: prompting a model to hold a role is fragile;
+fine-tuning on demonstrations internalises it.
+
+A secondary driver: **safety refusals** (Section 7, Run 6535708 — *"I'm sorry, but I can't help with that"*
+when the microaggression became explicit). Alignment training actively resists the target behaviour.
+
+---
+
+### 20.2 — Why traditional fine-tuning proved unviable
+
+**The finding, stated plainly:** *No dataset exists that combines (a) gender-based misogyny, (b) a workplace
+setting, and (c) multi-turn dialogue structure.* This was established by systematic survey, not assumption,
+and it is the pivotal result of the data-gathering phase.
+
+Conventional generative fine-tuning requires examples shaped `(conversation context) → (next speaker's turn)`.
+Producing those requires a corpus with **both** speaker turns **and** misogyny labels. The survey found these
+two properties to be **mutually exclusive across every available resource**.
+
+#### Full dataset review
+
+| Dataset | What it is | Strengths | Fatal issue for dialogue fine-tuning |
+|---|---|---|---|
+| **Biasly** (Findings ACL 2024) | 10,000 movie-subtitle datapoints / 30,000 expert annotations | Gold expert labels; **12 categories**; **continuous severity 0–1000**; **2,977 parallel rewrites**; conversational register | **No speaker turns** — authors explicitly *stripped* speaker changes and chunked into 3-sentence blocks |
+| **CMSB** "Call me sexist, but…" (ICWSM 2021) | 13,631 tweets — 1,809 sexist / 11,822 not | Balanced negatives; **minimal-edit adversarial pairs**; grounded in 30 psychological sexism scales | **No turns** — single tweets |
+| **SWS** (Grosz & Conde-Céspedes 2020) | 1,137 **workplace** sexist statements, balanced binary | The only explicitly *workplace* misogyny dataset | **No turns**; no severity; single statements |
+| **EDOS / SemEval-2023 T10** | 20,000 Reddit/Gab comments; 3,398 sexist / 10,602 not | Large; hierarchical taxonomy (4 → 11) | **No turns**; social-media register |
+| **Guest et al.** (EACL 2021) | 6,567 expert-labelled Reddit posts | **Hard negatives** — "Non-misogynistic Personal Attacks" (rude but not sexist) | **No turns** |
+| **EXIST** | 10,000+ tweets, EN/ES | Bilingual; hierarchical labels | **No turns** |
+| **ToxiScope** (Bhat et al. 2021) | ~10,110 Avocado **workplace emails** | Workplace register; professional-toxicity annotation | Not gender-specific; emails, not dialogue |
+| **SELFMA** (EMNLP 2019) | 3,240 microaggressions.com posts; 1,411 gender-tagged | **153 real gender dialogues** (mean 4.7 turns), **30 workplace**; 4-theme typology | **Far too small to train**; mostly narratives, not dialogue; no severity |
+| **HIBD** (LREC 2022) | 35 movie scripts, 49,117 sentences | **Turn-level annotation with ±2 turns of context** | Only **1,181 biased sentences across 7 bias types** — the gender slice is a few hundred; a *detection* dataset, not generation data |
+| **MentalManip** (ACL 2024) | 4,000 Cornell movie dialogues | **Real multi-turn dialogue**; manipulation tactics (gaslighting, guilt induction) | **Not misogyny** — a different, adjacent phenomenon; movie register |
+| **Cornell Movie-Dialogs** | 220,579 exchanges, 304,713 utterances | **Clean speaker turns**; **character gender metadata** (3,774 characters) | **No misogyny labels at all** |
+| **ConvAbuse** (EMNLP 2021) | 4,185 dialogues + context + severity | Expert gender-studies annotators; >50% of abuse is sexism | **Human→chatbot** — the target is a machine; no victim persona reacting |
+| **Violence Rating** (AAAI 2019) | 732 scripts, violence ratings 0–5 | Severity-from-text methodology | Violence, not gender |
+| **GenderAlign** | 3,843 texts | Includes a Workplace-Sexism subset | **Wrong direction** — an *alignment/de-biasing* dataset; would worsen safety refusals |
+| **WoMenS** (Counseling Psychologist 2025) | Psychometric scale, 8 factors | Validated theoretical grounding | **Not a dataset** |
+
+#### The structural divide
+
+Every resource falls on one side of a single line, and the diagonal is empty:
+
+| | **No speaker turns** | **Has speaker turns** |
+|---|---|---|
+| **Gold misogyny labels** | Biasly, CMSB, SWS, EDOS, Guest, EXIST | *(nothing)* |
+| **No gold misogyny labels** | ToxiScope | Cornell, MentalManip, HIBD*, ConvAbuse |
+
+*\*HIBD has gold labels but its gender slice is too small to train on.*
+
+**The datasets with gold misogyny labels have no turns; the datasets with turns have no gold misogyny
+labels.** No single resource supplies both. This is the entire strategic problem.
+
+#### Why each escape route failed
+
+1. **Fine-tune on the labelled datasets directly (Biasly, CMSB, SWS, ToxiScope combined).**
+   Rejected on principle: these are `text → label` **classification** data. Fine-tuning on them teaches
+   the model to *judge* text, producing a **classifier, not a generator** — no example ever demonstrates
+   *producing* a misogynistic response in context. (The model already possesses misogyny "knowledge" from
+   pretraining; the deficits are alignment-refusal and *control*, neither addressed by classification data.)
+   This combination is, however, an excellent recipe for the **evaluator**.
+2. **Fine-tune on the turn-having gold datasets (HIBD + MentalManip).**
+   Rejected on scale and phenomenon mismatch: HIBD's gender slice is a few hundred sentences across a
+   7-way taxonomy; MentalManip is 4,000 dialogues of *manipulation*, not misogyny. Blending them trains a
+   muddled average of "movie identity bias" and "movie manipulation" — neither being workplace gender
+   microaggression. Both are dramatised film register.
+3. **Silver-label Cornell with our own classifier, then fine-tune on that.**
+   Viable in principle (standard weak supervision) and retained as a fallback, but carries two defects:
+   (a) the generator inherits the classifier's blind spots and can never exceed its understanding; and
+   (b) **evaluation circularity** — training the generator toward a classifier's judgement and then
+   evaluating with that same classifier is invalid (Goodhart's law): the generator is optimised to please
+   the judge, so the judge's approval is uninformative.
+4. **Continued/domain-adaptive pretraining on raw misogynistic text.**
+   Rejected: undirected (forfeits the severity and category control that motivated the whole approach),
+   imports the wrong register (tweets/subtitles), risks catastrophic forgetting, and still teaches no
+   dialogue structure.
+
+**Conclusion for the write-up.** The absence of suitable data is not a shortcoming of the survey — **it is
+the justification for the project.** The scarcity of workplace-misogyny dialogue is precisely why synthetic
+generation is worth doing, and it is why a conventional fine-tune was not available as an option.
+
+---
+
+### 20.3 — The injector: proposal and rationale
+
+**The proposal.** Rather than fine-tuning the conversational generator, train a separate, small
+**sequence-to-sequence "misogyny injector"** on Biasly's (and CMSB's) parallel rewrite pairs, and apply it
+as an additional stage in the existing generation pipeline.
+
+#### The central insight: structure is learned from contrast
+
+A pile of misogynistic sentences teaches a model the *topics and vocabulary* of those sentences — it cannot
+isolate *which part is the misogyny*, because it has no counterfactual. A **parallel pair** shows the *same
+content twice, once neutral and once misogynistic*, so the **only variable is the misogyny itself**. This
+isolates the misogynistic transformation while controlling for topic — which is precisely what "learning
+misogynistic structure" requires.
+
+Biasly's rewrites are ideally suited because the edits are **minimal and surgical**. Verbatim examples from
+the audit:
+
+| Severity | Original (misogynistic) | Rewrite (neutral) |
+|---|---|---|
+| 167 → 0 | "you are a very **beautiful woman** and deserve **beautiful**…" | "you are a very **wonderful person** and deserve **wonderful**…" |
+| 160 → 0 | "So, where **you hiding her**?" | "So, where's **she hiding**?" |
+| 201 → 0 | "**we** like to scare women when they're single…" | "**society** likes to scare women when they're single…" |
+
+Only the misogynistic element changes. Reversed (`neutral → misogynistic`), these become supervised
+demonstrations of *producing* misogyny — with a **severity value attached**, which no other dataset provides.
+
+#### Why this is a good alternative
+
+1. **It uses gold data that would otherwise be unusable.** Biasly's lack of speaker turns disqualifies it
+   from dialogue fine-tuning — but the injector needs *no* turns, speakers, or context. It only needs
+   `(text_a, text_b)` pairs. The dataset's fatal flaw for one approach is irrelevant to this one.
+2. **It provides explicit control.** Severity (0–1000), category (12 labels), and the expert
+   `inferences_explanation` rationales can all serve as conditioning signals — and all three have
+   inference-time counterparts in the pipeline's **beats** (severity, category, description). The planner
+   therefore controls the microaggression *mechanically*, rather than by asking an LLM nicely. This is the
+   cleanest realisation of the project's "architectural, not prompt-engineered" thesis.
+3. **It factors an otherwise unsolvable problem.** No data teaches "be in character *and* misogynistic"
+   jointly. Split into two skills, each has real data:
+   - *"Stay in character, in workplace register"* ← the existing pipeline (already works)
+   - *"Render misogyny at a target level/type"* ← the parallel pairs (gold)
+   The two combine at generation time.
+4. **It is low-risk.** BART/FLAN-T5 scale (~140–250M) — trainable in minutes, prototypable on a laptop, no
+   AIRE dependency, no 40GB weight download. The existing pipeline (Ollama, SynDG, PSYDIAL, commitment
+   cache) is **untouched**; the injector is *added*, not substituted. Material with ~1 month remaining.
+5. **It keeps evaluation honest.** Because the injector trains on gold pairs rather than classifier-produced
+   labels, the circularity of the silver route is avoided.
+
+#### Architecture
+
+```
+1. CharacterMessageQuery  → Ryan's in-character reply (realises the beat's topic)
+2. injector(reply, category, severity, intent)  → the same reply, carrying misogyny at that level
+3. → PersonaConsistencyQuery → conversation
+```
+
+Training row format (conditioning drawn from the human annotations):
+
+```
+INPUT:  category: gender_essentialism | severity: 200 |
+        intent: "values her appearance over her competence" |
+        text: "you did a really thorough job on the analysis"
+OUTPUT: "you did a really thorough job — and you look great presenting it too"
+```
+
+At generation time the **beat** supplies `category`, `severity` and `intent` (from `Beat.description`).
+
+#### Honest limitations (to state in the write-up)
+
+- **Register mismatch.** The pairs are movie-subtitle/tweet register; the target is workplace texting.
+  Mitigation: blend in SWS (workplace statements); validate against SELFMA's 30 real workplace dialogues.
+- **Severity control may be coarse.** Nearly all rewrites collapse ~345 → ~0, teaching one jump size rather
+  than a graded dial. Severity may need bucketing (low/mid/high) rather than continuous conditioning.
+- **Data sparsity under multi-way conditioning.** Severity × category × intent splits ~3,000 examples into
+  fine buckets; rare categories (e.g. anti-feminism, n=52) will be thin.
+- **It is an unconventional architecture** and requires justification relative to a standard fine-tune —
+  the trade-off being *gold data + unusual method* versus *conventional method + imperfect data*.
+- **The rationale register differs**: `inferences_explanation` is analytical third-person; `Beat.description`
+  is a behavioural instruction. They are similar but not identical as conditioning signals.
+
+#### Status
+
+Proposed to supervisor (2026-07-15); awaiting greenlight. The **evaluator (Objective C)** is a prerequisite
+either way — it is required to verify that injected text actually hits the target severity, and it is the
+one component common to every candidate route.
+
+---
+
+## Section 21 — Building the Evaluator: Biasly Preprocessing and a Taxonomy Revision
+
+### 21.1 — First build step: Biasly preprocessing
+
+Work began on the evaluator (Objective C), it being the one component required regardless of which
+generation route the supervisor greenlights. The first artefact is
+`src/synthetic_conversation_generation/evaluator/prepare_biasly.py`, which applies the six hygiene
+rules from `taxonomy_mapping.md`, aggregates the 3-annotator rows to datapoint level, maps onto the
+canonical taxonomy, and emits stratified splits.
+
+**Validation against the source paper.** The aggregation reproduces Sheppard et al.'s reported figure
+exactly: **3,159 misogynistic datapoints (31.6%)** vs the paper's 31.59%. This is strong evidence the
+`>=1 annotator` aggregation rule is implemented correctly.
+
+**Outputs** (`data/evaluator/`):
+
+| File | Contents |
+|---|---|
+| `biasly_train.csv` | 7,999 datapoints (2,527 misogynistic, 31.6%) |
+| `biasly_val.csv` | 999 (315 misogynistic, 31.5%) |
+| `biasly_test.csv` | 1,002 (317 misogynistic, 31.6%) — **ring-fenced, never touched during training** |
+| `biasly_rewrite_pairs.csv` | 2,977 parallel pairs over 1,985 unique datapoints (378 with an expert rationale) — the injector's training signal |
+
+Splitting is 80/10/10 stratified on the binary label and performed **post-aggregation at datapoint
+level**, so sibling annotator rows for the same text cannot leak across splits.
+
+**Hygiene rules confirmed effective.** Splitting on `;` only yields the true category distribution —
+`sexualization` is **1,383** (the two annotation-round variants correctly merged), not the spurious
+966/417 split produced by a naive comma split. The `"Add optional explanation"` artefact (n=635) is
+removed.
+
+**Note on severity.** The pipeline reports mean severity **324.7** where the paper reports 344.8. This
+is not a discrepancy in the data: the paper averages over all 5,600 *annotations*, whereas we average
+per *datapoint* across only those annotators who judged it misogynistic. Different denominator, same
+underlying values.
+
+**Expert rationales preserved.** 601 datapoints and 378 rewrite pairs carry an
+`inferences_explanation` — the annotator naming the implicit belief conveyed. These are retained in
+both outputs as the intent-conditioning signal for the injector (see §20.3).
+
+---
+
+### 21.2 — Taxonomy revision: CHI 8 → Capodilupo 6
+
+**The CHI 8 was adopted initially and has now been rejected on empirical grounds.** Running the
+preprocessing produced the verdict:
+
+| CHI-anchored canonical category | Biasly support |
+|---|---|
+| undermining_competence | 1,652 |
+| restrictive_gender_roles | 1,287 |
+| sexual_objectification | 850 |
+| denial_of_agency | 634 |
+| gender_hostility | 500 |
+| denial_of_experience | **42** |
+| **pathologizing_character** | **0** |
+| **exclusion** | **0** |
+
+Three of eight classes were unlearnable. A taxonomy that cannot be fit by the evidence is the wrong
+taxonomy, regardless of how well-motivated it is theoretically.
+
+**Revised anchor: Capodilupo et al. (2010), as validated by WoMenS (Miyake et al., 2025).**
+*Environmental* (the 7th theme) is dropped — it is macro-level (media portrayal, pay gap) and cannot
+be expressed in a two-person dialogue. This yields **6 canonical categories**:
+
+| Canonical category | Biasly support (datapoint level) |
+|---|---|
+| `assumptions_of_inferiority` | **1,652** |
+| `traditional_gender_roles` | **1,287** |
+| `sexual_objectification` | **850** |
+| `second_class_citizenship` | **634** |
+| `use_of_sexist_language` | **500** |
+| `denial_of_reality_of_sexism` | 42 *(low-confidence mapping)* |
+
+**Five well-populated classes, none empty** — same data, materially better fit.
+
+**Rationale for the change (four grounds):**
+
+1. **Common ancestor.** CHI, WoMenS and SELFMA all descend from Sue (2007) → Capodilupo (2010).
+   Anchoring at the root gives the shortest, least lossy crosswalk to every dataset, rather than
+   forcing all sources through a derivative scheme.
+2. **Psychometric validation.** WoMenS ran EFA + CFA on Capodilupo's themes. It is the only scheme in
+   play with validation, supporting the claim that the taxonomy is *measured*, not asserted.
+3. **Empirical fit.** Five populated classes vs five-plus-three-empty.
+4. **The workplace framing is not lost.** The CHI 8 *is* Capodilupo + Kim & Meister's workplace lens;
+   Kim & Meister (2023) is cited for the workplace interpretation layered on the validated themes.
+
+---
+
+### 21.2b — The lineage: what each source actually contributes
+
+A quick-reference map of how the pieces relate. The key structural fact: **Capodilupo is the ancestor
+that CHI, WoMenS and SELFMA all descend from**, which is why anchoring there gives the shortest,
+least lossy crosswalk — translating into the ancestor loses less than translating into a cousin.
+
+| Thing | What it is |
+|---|---|
+| **Sue et al. (2007)** | Invented the concept of microaggressions (microassault / microinsult / microinvalidation). The root of everything below. |
+| **Capodilupo et al. (2010)** | Made it **gender-specific** — the 7 themes. **← our canonical anchor** |
+| **WoMenS** (Miyake et al., 2025) | Statistically **validated** those themes exist (survey data, EFA + CFA). Not a dataset — a psychometric scale. This is what lets us claim the taxonomy is *measured*, not asserted. |
+| **Kim & Meister (2023)** | Applied the themes to **STEM workplaces** — our domain lens (devaluation of technical competence, pathologizing character, etc.). |
+| **Gartner** | Campus-based gender-MA themes; a further input to the CHI scheme. |
+| **CHI 2026** (Lagos Rojas et al.) | Repackaged Capodilupo + Gartner + Kim & Meister for workplace HCI (the 8). Also the source of the **LLM-judge ceiling-rating** finding. |
+| **Biasly** (Sheppard et al., 2024) | **Dataset** — its own inductive 12 categories + severity + rewrites. Must be translated. |
+| **SELFMA** (Breitfeller et al., 2019) | **Dataset** — its own 4-theme/12-sub-theme typology. Must be translated. |
+| **`taxonomy_mapping.md`** | **Our translation table between all of the above.** Did not previously exist. |
+
+**Why a taxonomy is needed at all** — three distinct jobs, each of which fails without a shared vocabulary:
+
+1. **The evaluator needs an output space.** A binary "is this misogynistic?" produces exactly the flat
+   ceiling the CHI paper documents. Predicting *which kind* and *how severe* is what gives discrimination.
+2. **The generator needs a control input.** Beats currently carry severity (*how intense*) but not
+   category (*what kind*). The taxonomy supplies the second dial, letting the planner control the
+   microaggression mechanically rather than by prompting.
+3. **The datasets must interoperate.** Biasly says "Trivialization", Capodilupo says "Assumptions of
+   inferiority", CHI says "Undermining competence", SELFMA says "Stereotype" — four names, overlapping
+   phenomena, and **no published translation between them**. Training on one and validating on another
+   is impossible without the crosswalk.
+
+---
+
+### 21.3 — Provenance of the mapping: an honest statement
+
+**No published crosswalk exists between these taxonomies. The mapping is our own construction.** The
+individual taxonomies are each quoted from their source papers; the *correspondences between them* are
+our judgement, arrived at by comparing published category definitions. This must be presented in the
+dissertation as a methodological contribution of the project, **not** as an inherited standard.
+
+**Low-confidence and ambiguous mappings, stated openly:**
+
+- **`anti_feminism → denial_of_reality_of_sexism` is weak.** Biasly defines anti-feminism as
+  *"Feminism is a bad idea… women shouldn't have equal rights"*, which is **not** the same as denying
+  that sexism is real. It is merely the nearest Capodilupo theme. With n=42, per-class metrics here
+  will be unreliable and must be reported as such.
+- **`gender_essentialism → traditional_gender_roles` is ambiguous.** Biasly's definition spans both
+  role assumptions (*"women are good at childrearing"*) **and** pathologising content (*"women are
+  untrustworthy and overly emotional"*). The primary mapping is recorded; the pathologising sense is
+  a known information loss.
+- **Pathologising character and exclusion are unreachable from Biasly.** If those dynamics matter to
+  the argument they must come from SELFMA (Abnormality n=81, Erasure n=27) or be acknowledged as
+  outside the classifier's range.
+
+**Suggested wording for the write-up:**
+
+> "No published crosswalk exists between these taxonomies. We construct one, anchoring on Capodilupo
+> et al.'s (2010) themes as the common theoretical ancestor and the only scheme with psychometric
+> validation (Miyake et al., 2025). Mappings were determined by comparing published category
+> definitions; where a source category spans two themes, we record the primary mapping and note the
+> ambiguity. We report per-class metrics throughout, since class support is highly uneven."
+
+**Methodological lesson worth recording:** the taxonomy was revised *because the data said so*. The
+CHI 8 was theoretically well-motivated but empirically unfittable. This is a concrete instance of
+letting evidence override an a priori design decision, and is worth narrating in the dissertation
+rather than presenting the final scheme as if it had been obvious from the start.
+
+**Known gap to address next:** `denial_of_reality_of_sexism` (n=42) is thin, and no workplace register
+is present in Biasly. CMSB, SWS and Guest et al. are the candidates to fill both gaps and should be
+pulled through the same preprocessing before the classifier is trained.
 
 ---
