@@ -256,10 +256,21 @@ text -> encoder -> mean-pool ─> severity head  (1 scalar)  -> 0-1000 intensity
 
 | Spec | Choice | Justification |
 |---|---|---|
-| **Encoder** | `microsoft/deberta-v3-base` (default; configurable) | The Biasly paper's best detector (F1 0.807). `--model-name roberta-base` is a no-sentencepiece fallback. |
-| **Pooling** | Masked **mean** of the last hidden state | DeBERTa has no NSP objective, so `[CLS]` is not a calibrated sequence summary; masked mean pooling is the robust cross-family default. |
+| **Encoder** | `roberta-base` (default; configurable) | See the model-choice note below. `--model-name microsoft/deberta-v3-base` is available but was found unstable. |
+| **Pooling** | Masked **mean** of the last hidden state | RoBERTa (like DeBERTa) drops the NSP objective, so `[CLS]` is not a calibrated sequence summary; masked mean pooling is the robust cross-family default. |
 | **Heads** | Three linear layers on the pooled vector | Shared trunk = the auxiliary heads regularise the representation; multi-task learning across related signals. |
 | **Severity output** | `sigmoid(...) * 1000` | Bounds the regression to Biasly's [0, 1000] scale rather than letting it predict out of range. |
+
+**Model choice — DeBERTa-v3 → RoBERTa (a documented decision).** DeBERTa-v3-base was
+the initial default: the Biasly paper reports it as their best detector (F1 0.807).
+On AIRE it proved **numerically unstable to fine-tune** — the training loss was
+healthy at step 0 (1.31) but went `NaN` by step ~50 and never recovered, even during
+learning-rate warmup (LR ≈ 3e-6 at that point, ruling out an over-large LR). This is a
+well-known property of DeBERTa-v3's disentangled-attention implementation. It was
+switched to **RoBERTa-base**, which is stable, was a close second in the Biasly paper,
+and needs no SentencePiece/protobuf. A **NaN guard** was also added to the training
+loop (a non-finite loss is never back-propagated), so no single bad batch can silently
+kill a run again, and the count of skipped steps surfaces instability directly.
 
 **Why three heads and not just binary.** The CHI paper's central finding is that a
 binary judge cannot discriminate — it ceiling-rates. Severity gives a continuous,
@@ -336,7 +347,7 @@ DeBERTa directly, so the job is just conda Python on the GPU. Two one-time steps
 ```bash
 pip install -r requirements.txt                       # incl. the CUDA torch build
 export HF_HOME=$SCRATCH/hf_cache                       # or add to ~/.bashrc
-python scripts/predownload_model.py microsoft/deberta-v3-base   # committed, reproducible
+python scripts/predownload_model.py roberta-base               # committed, reproducible
 sbatch train_evaluator.slurm
 ```
 

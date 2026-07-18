@@ -43,7 +43,7 @@ class MultiHeadEvaluator(nn.Module):
     Shared encoder + {binary, severity, category} heads.
 
     Args:
-        model_name:    HF encoder id (default DeBERTa-v3, the Biasly paper's best).
+        model_name:    HF encoder id (default RoBERTa-base — stable; DeBERTa-v3 is unstable to fine-tune).
         binary_pos_weight: weight for the positive class in the binary loss, to
                        counter the 19% positive rate. Passed from the data (n_neg/n_pos).
         lambda_severity / lambda_category: relative weights of the auxiliary losses.
@@ -51,7 +51,7 @@ class MultiHeadEvaluator(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "microsoft/deberta-v3-base",
+        model_name: str = "roberta-base",
         binary_pos_weight: float = 4.0,
         lambda_severity: float = 1.0,
         lambda_category: float = 1.0,

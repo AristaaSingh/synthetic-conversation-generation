@@ -4,7 +4,7 @@ Train the misogyny evaluator (Objective C).
     python -m synthetic_conversation_generation.evaluator.train_evaluator \
         --data-dir data/evaluator --output-dir models/evaluator --epochs 3
 
-A shared DeBERTa encoder with binary + severity + category heads (see model.py),
+A shared transformer encoder (RoBERTa) with binary + severity + category heads (see model.py),
 trained on the pooled Biasly/CMSB/Guest/SWS data and evaluated on TWO held-out
 sets:
   * biasly_test.csv  — in-distribution (same family as most training data)
@@ -200,7 +200,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Train the misogyny evaluator")
     ap.add_argument("--data-dir", type=Path, default=Path("data/evaluator"))
     ap.add_argument("--output-dir", type=Path, default=Path("models/evaluator"))
-    ap.add_argument("--model-name", default="microsoft/deberta-v3-base",
+    ap.add_argument("--model-name", default="roberta-base",
                     help="Encoder. roberta-base is a no-sentencepiece fallback.")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=16)
@@ -246,7 +246,7 @@ def main() -> int:
 
     for epoch in range(args.epochs):
         model.train()
-        running = 0.0
+        running, n_ok, n_skipped = 0.0, 0, 0
         for step, batch in enumerate(train_loader):
             opt.zero_grad()
             out = model(
@@ -257,13 +257,29 @@ def main() -> int:
                 category_label=batch["category_label"].to(device),
                 category_mask=batch["category_mask"].to(device),
             )
-            out.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sched.step()
-            running += out.loss.item()
+            # NaN guard: never apply a non-finite gradient. A single NaN loss,
+            # back-propagated, poisons EVERY weight and silently kills the whole run
+            # (as happened with DeBERTa-v3 — valid at step 0, nan by step 50, dead
+            # thereafter). Skipping the step keeps the weights finite; if many steps
+            # are skipped, that itself is the signal that the model/config is unstable.
+            if torch.isfinite(out.loss):
+                out.loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                running += out.loss.item()
+                n_ok += 1
+            else:
+                n_skipped += 1
+            sched.step()
             if step % 50 == 0:
-                print(f"  epoch {epoch+1} step {step}/{len(train_loader)} loss {out.loss.item():.4f}")
-        print(f"epoch {epoch+1}: mean train loss {running/len(train_loader):.4f}")
+                shown = out.loss.item() if torch.isfinite(out.loss) else float("nan")
+                print(f"  epoch {epoch+1} step {step}/{len(train_loader)} loss {shown:.4f}")
+        mean_loss = running / max(1, n_ok)
+        print(f"epoch {epoch+1}: mean train loss {mean_loss:.4f} "
+              f"({n_ok} steps, {n_skipped} skipped for non-finite loss)")
+        if n_skipped > 0.5 * len(train_loader):
+            print(f"  WARNING: over half the steps produced a non-finite loss — the model "
+                  f"or config is unstable. Metrics below are unlikely to be meaningful.")
 
     print("\n=== IN-DISTRIBUTION (Biasly held-out test) ===")
     id_metrics = evaluate(model, id_loader, device, with_category=True)

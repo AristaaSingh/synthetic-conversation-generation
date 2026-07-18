@@ -35,6 +35,9 @@ torch>=2.2
 openpyxl==3.1.5
 
 # ── Optional: offline Hawkes validation plots (temporal/validate_hawkes.py) ───
-# Not required for generation, training, or the test suite.
-scipy==1.18.0
-matplotlib>=3.7   # not currently installed locally; install if running the plots
+# Not required for generation, training, or the test suite — install only to
+# regenerate the burstiness plots. Left version-FLEXIBLE on purpose: these are the
+# only cross-environment-fragile pins (local dev is Python 3.12, AIRE is 3.11, and
+# scipy 1.18 requires 3.12), and nothing about the results depends on their version.
+scipy>=1.9        # any 3.11-compatible build is fine
+matplotlib>=3.7   # install if running the plots

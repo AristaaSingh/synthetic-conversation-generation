@@ -3,8 +3,8 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --time=01:00:00
-#SBATCH --mem=32G
-#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --cpus-per-task=4
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
@@ -25,7 +25,7 @@
 #      committed helper (it also verifies the OFFLINE load, reproducing the compute
 #      node's conditions):
 #        export HF_HOME=${SCRATCH}/hf_cache
-#        python scripts/predownload_model.py microsoft/deberta-v3-base
+#        python scripts/predownload_model.py roberta-base
 #
 #   The prepared data (data/evaluator/*.csv) is tracked in git, so it arrives with
 #   the repo — no separate transfer needed. Only the RAW datasets (Individual
@@ -59,8 +59,8 @@ ${PYTHON} -c "import torch; print('  torch cuda:', torch.cuda.is_available(), '|
 echo "── Pre-flight: model cache ──"
 ${PYTHON} -c "
 from transformers import AutoModel, AutoTokenizer
-AutoTokenizer.from_pretrained('microsoft/deberta-v3-base')
-AutoModel.from_pretrained('microsoft/deberta-v3-base')
+AutoTokenizer.from_pretrained('roberta-base')
+AutoModel.from_pretrained('roberta-base')
 print('  model + tokenizer load from cache OK')
 " || {
     echo "FAILED: model not in cache. Run the pre-download step (see header) on a login node."
@@ -71,7 +71,7 @@ print('  model + tokenizer load from cache OK')
 ${PYTHON} -m synthetic_conversation_generation.evaluator.train_evaluator \
     --data-dir data/evaluator \
     --output-dir models/evaluator_${RUN_ID} \
-    --model-name microsoft/deberta-v3-base \
+    --model-name roberta-base \
     --epochs 3 \
     --batch-size 16 \
     --lr 2e-5 \

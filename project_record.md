@@ -2893,3 +2893,104 @@ the real `deberta-v3-base` tokenizer was confirmed to load).
 recorded in evaluator.md §10 so a weak category head (Biasly-dominated support) is not mistaken for a bug.
 
 ---
+
+### 27.3 — First real training run failed: DeBERTa-v3 NaN instability (job 6686540)
+
+The first full evaluator training run **failed** — not with an error, but silently: every metric
+came back 0, and the model predicted "not misogynistic" for everything (including a **0% catch-rate on
+SELFMA**). Diagnosis from the training log:
+
+```
+epoch 1 step 0    loss 1.3116     <- healthy starting loss
+epoch 1 step 50   loss nan        <- diverged within ~50 updates, dead thereafter
+```
+
+**Diagnosis: DeBERTa-v3-base is numerically unstable to fine-tune.** The evidence rules out the usual
+suspects:
+- **Not the data/code** — the loss at step 0 was a sane 1.31, so the forward pass, data loading, and
+  masked multi-task loss were all correct (`pool_size 28575`, `pos_weight 4.25` — both right).
+- **Not the learning rate** — NaN appeared at step 50, still inside LR warmup, where LR ≈ 3e-6. A NaN at
+  that tiny an LR cannot be an over-large step.
+- **Not my training loop** — the `--smoke` test on a RoBERTa-family model trains cleanly with no NaN.
+
+This is a documented property of DeBERTa-v3's disentangled-attention implementation. DeBERTa-v3 had been
+chosen as the default only because the Biasly paper reports it as their best detector (F1 0.807) — but
+"best on their hardware" is worthless if it will not train on ours.
+
+**Two fixes:**
+1. **Default encoder switched to `roberta-base`** — stable, a close second in the Biasly paper, and it
+   needs no SentencePiece/protobuf (BPE tokenizer, so it also sheds a class of tokenizer friction). The
+   `--smoke` RoBERTa run confirmed the training code converges on this family.
+2. **NaN guard added to the training loop** — a non-finite loss is never back-propagated (a single NaN
+   loss otherwise poisons every weight and silently kills the whole run, exactly as happened here). The
+   per-epoch log now reports the count of skipped steps, so instability surfaces immediately instead of
+   being discovered three metrics later.
+
+Also recorded: this is a genuine methods decision, not a workaround, and is written up in **evaluator.md
+§6** (the DeBERTa→RoBERTa model-choice note) for the dissertation.
+
+**Incidental infrastructure notes from getting to this run** (all on AIRE, all resolved):
+- The env's pre-installed **torch was compiled for a newer CUDA than the node's driver** (driver 12.6);
+  fixed by reinstalling the `cu126` build (`--index-url .../cu126`) — same torch *version*, correct CUDA
+  *build*. This is a hardware-match, not a version downgrade.
+- **`scipy==1.18.0` required Python 3.12** but AIRE's env is 3.11; the exact pin broke the install. scipy
+  is optional (Hawkes plots only), so it was relaxed to `scipy>=1.9`. Lesson recorded: pin the
+  result-affecting stack exactly, keep optional tooling version-flexible.
+- SLURM resources trimmed (8→4 CPU, 32→16 GB) — the job is GPU-bound and the GPU request is what gates the
+  queue.
+
+**Status:** RoBERTa re-run in progress. If it also NaNs (unlikely, given the clean RoBERTa smoke run), the
+fault would lie in the training code rather than the model, and would be investigated there.
+
+---
+
+### 27.4 — Evaluator trained successfully (RoBERTa, job 6687095)
+
+The RoBERTa re-run **worked** — trained cleanly with no NaN steps. This is the first working evaluator.
+
+**In-distribution (Biasly held-out test):**
+
+| Head | Result | Read |
+|---|---|---|
+| Binary | P 0.65 / R 0.82 / **F1 0.72 / macro-F1 0.78** | In the same league as the Biasly paper's DeBERTa-v3 (0.807 macro-F1). High recall is the intended trade-off — over-flag rather than miss. |
+| Severity | **MAE 84.7** (~8.5% of the 0–1000 scale), **Pearson r 0.58** | The severity head learned a real signal — the evaluator can rank *how bad*, not just *whether*. This is the core justification for the multi-head design. |
+| Category (per-class F1 / support) | assumptions_of_inferiority 0.69/171, sexual_objectification 0.63/71, traditional_gender_roles 0.61/128, use_of_sexist_language 0.56/49, second_class_citizenship 0.37/69, **denial_of_reality_of_sexism 0.00/4** | 4 of 6 usable. The 0.00 is on a 4-example class (~34 in training) — the documented Biasly-only limitation (evaluator.md §4a), not a bug. |
+
+**Out-of-distribution (SELFMA — the headline generalisation result):**
+
+- **Catch-rate (recall): 0.49.** A classifier trained on movie subtitles + tweets + Reddit catches ~half
+  of real, human-reported workplace microaggressions it has never seen. A genuine, reportable finding —
+  it quantifies the transfer gap, attributable to (a) register (social media/film → workplace) and
+  (b) format (single statements → multi-turn dialogue), both pre-documented in evaluator.md §4a/§11.
+- **Precision/F1/macro-F1 on SELFMA are meaningless and must be ignored** — SELFMA is 100% positive, so
+  precision is 1.0 by construction (no negatives). Only recall is defined on a positives-only set. The
+  trainer prints the recall as the headline for exactly this reason.
+
+**Verdict:** a working, usable evaluator with defensible, honest metrics. Sufficient to establish the
+generation baseline and to measure whether the injector improves generation (its purpose). Weak spots are
+documented and expected. `pool_size 28575`, `pos_weight 4.25` confirm the data pipeline.
+
+**How to frame the DeBERTa→RoBERTa arc in the write-up:** not a failure — evidence-driven engineering.
+Chose the paper's best-reported model, found it would not train stably on the target hardware, diagnosed
+why from the loss trajectory (§27.3), and switched to the stable model the same paper ranked second,
+landing within ~0.03 macro-F1 of the reported best.
+
+### 27.5 — Planned refinement: threshold tuning (not yet done)
+
+The binary decision threshold is currently fixed at **0.5**, which is arbitrary. Because SELFMA is
+all-positive, **lowering the threshold would raise the OOD catch-rate** (currently 0.49) at the cost of
+in-distribution precision. Worth a small analysis:
+
+- **Tune the threshold on the Biasly *validation* split** (never on the test set or SELFMA — that would be
+  fitting to the thing being measured), selecting the operating point by F1 or a chosen precision/recall
+  trade-off.
+- Report the chosen threshold and the resulting shift on both the in-distribution test and SELFMA.
+
+This is a small post-hoc analysis, **not a retrain** — the trained model is reused, only the decision
+threshold changes. It would strengthen the OOD headline and is a legitimate, standard step. Deferred; the
+current 0.5-threshold metrics are already reportable.
+
+**Other refinements noted but deferred** (evaluator.md §11): average over seeds for a headline number;
+per-message SELFMA scoring as a fallback if the statement→dialogue format mismatch proves limiting.
+
+---
