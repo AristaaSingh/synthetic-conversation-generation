@@ -1,8 +1,40 @@
-anthropic
-argparse
-openai
-requests
-ollama>=0.1.27
-transformers>=4.38.0
-torch
-PyYAML
+# Versions pinned to the verified working local environment (pip freeze, 2026-07).
+# Grouped by what needs them, so an AIRE env can install only the relevant subset.
+
+# ── Core: generation pipeline ────────────────────────────────────────────────
+# The pipeline talks to gpt-oss through the Ollama server, so it needs no ML stack.
+anthropic==0.84.0
+openai==2.28.0
+ollama==0.6.1
+requests==2.32.5
+PyYAML==6.0.3
+
+# ── Evaluator / injector training (Objective C / B) ──────────────────────────
+# These load models directly with transformers (no Ollama). This is the subset
+# train_evaluator.slurm needs on AIRE.
+transformers==5.3.0
+pandas==3.0.3
+numpy==2.4.3
+scikit-learn==1.9.0       # evaluator metrics
+sentencepiece==0.2.2      # DeBERTa-v3 tokenizer
+protobuf==7.35.1          # DeBERTa-v3 slow->fast tokenizer conversion
+huggingface_hub==1.7.1    # model download / offline cache
+safetensors==0.7.0        # transformers weight format
+tokenizers==0.22.2        # transformers fast tokenizers
+
+# torch is intentionally NOT hard-pinned to a build. Local is 2.10.0 (CPU/MPS);
+# AIRE needs the CUDA build of a compatible version, installed from the CUDA wheel
+# index, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Pinning torch==2.10.0 here would pull the wrong (CPU) build on AIRE.
+torch>=2.2
+
+# ── Preprocessing only (run once; outputs are committed CSVs) ─────────────────
+# Needed to RE-RUN dataset preprocessing (SWS/SELFMA ship as .xlsx). Not needed to
+# train on AIRE, since data/evaluator/*.csv are tracked in git.
+openpyxl==3.1.5
+
+# ── Optional: offline Hawkes validation plots (temporal/validate_hawkes.py) ───
+# Not required for generation, training, or the test suite.
+scipy==1.18.0
+matplotlib>=3.7   # not currently installed locally; install if running the plots

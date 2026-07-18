@@ -2821,3 +2821,75 @@ it duplicates `ConversationState.summary`.
 read is computed twice per conversation by two different queries at two different frequencies.
 
 ---
+
+## Section 27 — The Evaluator, Objective C (full detail in `evaluator.md`)
+
+> Both the dataset preprocessing and the model/training are documented in depth in **`evaluator.md`**
+> (Part I: preprocessing; Part II: model and training). This section is a pointer + summary only.
+
+### 27.1 — Dataset preprocessing (evaluator.md Part I)
+
+Five datasets prepared into a single format under `data/evaluator/` for the evaluator (Objective C) and
+injector (Objective B).
+
+**Evaluator training pool: 28,587 texts, 5,451 positive (19.1%)** across four registers —
+Biasly (movie subtitles, the only source with severity + rich categories), CMSB (tweets, bulk
+negatives), Guest (Reddit, the **hard-negative** *rude-not-sexist* class that teaches the Ryan
+boundary), and SWS (the only **workplace**-register data). SELFMA (138 real gender dialogues, 25
+workplace) is the **out-of-distribution test set — never trained on**. Injector parallel corpora:
+Biasly rewrites (2,977) + CMSB adversarial pairs (2,222).
+
+**Audit outcome (all passing):**
+- **Zero train/SELFMA leakage** and **zero training/Biasly-test leakage** — the evaluation is
+  uncontaminated (the whole point of the SELFMA design, §19).
+- Exact-duplicate texts removed per source (was CMSB 302 / Guest 230 / SWS 11); **CMSB's 8
+  conflicting-label duplicate groups dropped entirely** (unreliable). A shared `deduplicate()` helper
+  (`evaluator/dataset_common.py`) does this and reports every removal.
+- Legitimate drops documented rather than silent: 70 CMSB adversarial pairs (wrong edit direction),
+  12 Guest image-only posts, and the 699→516 Guest multi-label collapse.
+
+**Two items the trainer must handle (recorded so they are not forgotten):**
+1. **Pool-time dedup** — CMSB and SWS share 12 identical tweets (same label); the concatenated pool
+   must be deduplicated before training.
+2. **Partial labels** — severity exists on Biasly only, category on Biasly+Guest; the trainer skips
+   those losses where the label is NA/blank, and must **not** filter on `in_scope` (a Biasly/Objective-B
+   flag, meaningless for the evaluator — see evaluator.md §2).
+
+**Class imbalance:** 19.1% positive — class weighting required, or the classifier degenerates to "mostly no".
+
+**For the write-up:** `evaluator.md` §4a lists the limitations to state explicitly in the
+dissertation. The headline one: **category supervision is essentially Biasly-only** — Guest's taxonomy is
+by linguistic form (orthogonal to Capodilupo's mechanisms), and CMSB/SWS have no category labels, so
+multi-source pooling strengthens the *binary* and *severity* heads far more than the *category* head.
+Also: severity is single-source (Biasly), the SELFMA category check is qualitative only (1–9/category),
+and only SWS (1,126 rows) matches the workplace register.
+
+---
+
+### 27.2 — Model and training (evaluator.md Part II)
+
+**`evaluator/model.py` + `evaluator/train_evaluator.py`.** A shared DeBERTa-v3 encoder with three heads
+— **binary** (misogynistic?), **severity** (0–1000 regression), **category** (6-way multi-label) —
+motivated by the CHI finding that a binary judge ceiling-rates and cannot discriminate. DeBERTa-v3 is the
+Biasly paper's best detector (F1 0.807); `--model-name` allows a RoBERTa fallback.
+
+Design points, each verified in the smoke test:
+- **Masked multi-task loss** — the defining constraint. Severity/category losses apply only to rows that
+  carry those labels; an absent label contributes nothing rather than a spurious zero. (Most rows are
+  binary-only.)
+- **Class weighting, not resampling** — `pos_weight = n_neg/n_pos` (~4.3) counters the 19.1% positive
+  rate; resampling would duplicate scarce positives and distort their severity/category signal.
+- **Two held-out test sets** — Biasly test (in-distribution: P/R/F1, per-class category F1 *with support*,
+  severity MAE + r) and **SELFMA (OOD)** where, being positives-only, **recall/catch-rate is the
+  headline generalisation number**. Both provably disjoint from the training pool (§27.1).
+- **`--smoke`** runs the entire path (pool → dedup → masked loss → both eval sets) on a tiny model, 200
+  rows, 1 epoch, **no GPU, ~15s** — the same fake-provider testing philosophy as the pipeline. It caught
+  the pool-time dedup firing (28,587 → 28,575, the 12 CMSB/SWS overlaps).
+
+Dependencies added: `scikit-learn`, `sentencepiece`, `protobuf` (the last two for the DeBERTa tokenizer;
+the real `deberta-v3-base` tokenizer was confirmed to load).
+
+**Status:** trainer built and smoke-verified; **not yet trained for real.** Expected result shape is
+recorded in evaluator.md §10 so a weak category head (Biasly-dominated support) is not mistaken for a bug.
+
+---
